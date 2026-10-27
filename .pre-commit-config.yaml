@@ -1,0 +1,14 @@
+# 新增：只检查本次提交中的 Python 文件，逐步接入现有多人协作项目。
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Ruff lint
+        entry: python -m ruff check
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: Ruff format
+        entry: python -m ruff format --check
+        language: system
+        types: [python]

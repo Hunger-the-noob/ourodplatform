@@ -53,6 +53,7 @@ testpaths = [
     "tests",
 ]
 python_files = ["test_*.py"]
+pythonpath = ["apps/platform/src"]  # 新增：源码检出后即可运行 pytest
 addopts = ["-v", "--strict-markers", "--tb=short"]
 
 markers = [

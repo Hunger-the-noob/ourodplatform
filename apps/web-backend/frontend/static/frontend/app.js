@@ -120,6 +120,31 @@ createApp({
         const validatingData = ref(false);
         const evaluatingModel = ref(false);
         let trainingPollTimer = null;
+        // 新增：数据工程后台任务、真实阶段进度与历史报告。
+        const engineering = reactive({ datasets: [], checks: [], formats: [], strategies: [] });
+        const dataForm = reactive({ dataset: "Rubbish_data_set", format: "yolo", task: "detect",
+            classes: "", train_rate: 0.8, val_rate: 0.1, seed: 42, split_strategy: "random" });
+        const dataJob = reactive({ status: "idle", progress: {}, result: null, error: null });
+        const dataHistory = reactive({ latest: null, reports: [] });
+        const dataSubmitting = ref(false);
+        const dataRunning = computed(() => dataSubmitting.value || dataJob.status === "running");
+        const selectedDataset = computed(() => engineering.datasets.find((d) => d.name === dataForm.dataset));
+        const comparison = computed(() => dataHistory.latest?.comparison || {});
+        const severityClass = (severity) => ({ ERROR: "severity-error", WARNING: "severity-warning",
+            INFO: "severity-info", PASS: "severity-pass" }[severity] || "");
+        const dataStageLabel = computed(() => {
+            const stage = dataJob.progress?.stage || "starting";
+            const [name, detail] = stage.split(":");
+            const labels = { starting: "准备任务", prepare: "检查原始数据", convert: "转换标注",
+                discover_classes: "发现类别", index: "建立标注索引", scan_labels: "扫描转换结果",
+                split: "固定种子划分", manifest: "生成划分契约", materialize: "复制图片与标签",
+                write_yaml: "写入数据集配置", snapshot: "扫描数据集", checks: "执行质量检查",
+                image_integrity: "图片完整性与解码", label_format: "标签格式、类别与归一化",
+                bbox_within_image: "检查目标框边界", manifest_lineage: "逐样本 SHA256 核验",
+                report: "生成报告和历史对比", complete: "全部阶段完成" };
+            return `${labels[name] || name}${detail ? ` · ${detail}` : ""}`;
+        });
+        let dataPollTimer = null;
 
         const inferenceFile = ref(null);
         const inferencePreview = ref("");
@@ -311,6 +336,7 @@ createApp({
                 recognitionHistory.value = recognitionResponse.data;
                 videoHistory.value = videoResponse.data;
                 Object.assign(trainingState, trainingResponse.data);
+                await loadDataEngineering();
                 apiOnline.value = true;
                 if (trainingState.status === "running") scheduleTrainingPoll();
                 if (!mediaResult.value && recognitionResponse.data.length) {
@@ -360,16 +386,67 @@ createApp({
             }
         };
         const validateDataset = async () => {
-            validatingData.value = true;
+            await startDataJob("validate");
+        };
+        const loadDataHistory = async () => {
+            const selected = dataForm.dataset;
+            const response = await axios.get(`${API}/data/history/`, { params: { dataset: selected } });
+            if (dataForm.dataset === selected) Object.assign(dataHistory, response.data);
+        };
+        const selectEngineeringDataset = async () => {
+            const selected = selectedDataset.value;
+            if (selected) {
+                dataForm.classes = (selected.classes || []).join(", ");
+                dataForm.format = engineering.formats.includes(selected.format) ? selected.format : "yolo";
+                dataForm.task = selected.task || "detect";
+            }
+            try { await loadDataHistory(); } catch (error) { showToast(getError(error), "error"); }
+        };
+        const scheduleDataPoll = () => {
+            if (dataPollTimer) window.clearTimeout(dataPollTimer);
+            dataPollTimer = window.setTimeout(pollDataJob, 800);
+        };
+        const pollDataJob = async () => {
             try {
-                const response = await axios.post(`${API}/data/validate/`);
-                showToast(response.data.summary || "数据验证完成");
-                await loadAll(false);
+                const response = await axios.get(`${API}/data/jobs/`);
+                Object.assign(dataJob, response.data);
+                validatingData.value = dataJob.status === "running";
+                if (dataJob.status === "running") scheduleDataPoll();
+                else {
+                    await loadAll(false);
+                    showToast(dataJob.status === "failed" ? dataJob.error : "数据任务已完成，请查看报告",
+                        dataJob.status === "failed" ? "error" : "success");
+                }
             } catch (error) {
                 showToast(getError(error), "error");
-            } finally {
-                validatingData.value = false;
+                scheduleDataPoll();
             }
+        };
+        const loadDataEngineering = async () => {
+            const [catalog, job] = await Promise.all([
+                axios.get(`${API}/data/engineering/`), axios.get(`${API}/data/jobs/`),
+            ]);
+            const firstLoad = engineering.datasets.length === 0;
+            Object.assign(engineering, catalog.data);
+            Object.assign(dataJob, job.data);
+            validatingData.value = dataJob.status === "running";
+            if (!selectedDataset.value && engineering.datasets.length) dataForm.dataset = engineering.datasets[0].name;
+            if (firstLoad) await selectEngineeringDataset();
+            else await loadDataHistory();
+            if (dataJob.status === "running") scheduleDataPoll();
+        };
+        const startDataJob = async (operation) => {
+            dataSubmitting.value = true;
+            try {
+                const payload = { ...dataForm, operation,
+                    classes: dataForm.classes.split(/[,，\n]/).map((c) => c.trim()).filter(Boolean) };
+                if (payload.format !== "yolo" && !payload.classes.length) delete payload.classes;
+                const response = await axios.post(`${API}/data/jobs/`, payload);
+                Object.assign(dataJob, response.data);
+                validatingData.value = true;
+                scheduleDataPoll();
+            } catch (error) { showToast(getError(error), "error"); }
+            finally { dataSubmitting.value = false; }
         };
         const evaluateModel = async () => {
             evaluatingModel.value = true;
@@ -580,6 +657,7 @@ createApp({
 
         onMounted(loadAll);
         onBeforeUnmount(() => {
+            if (dataPollTimer) window.clearTimeout(dataPollTimer);
             if (trainingPollTimer) window.clearTimeout(trainingPollTimer);
             if (toast.timer) window.clearTimeout(toast.timer);
             [inferencePreview, mediaImagePreview, mediaVideoPreview].forEach((item) => releaseUrl(item.value));
@@ -593,6 +671,8 @@ createApp({
             apiOnline,
             toast,
             dataset,
+            engineering, dataForm, dataJob, dataHistory, dataRunning, selectedDataset,
+            comparison, severityClass, dataStageLabel, selectEngineeringDataset, startDataJob,
             dashboard,
             modelInfo,
             modelStatusLabel,

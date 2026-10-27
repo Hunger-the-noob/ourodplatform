@@ -88,6 +88,7 @@ path = "src/od_platform/_version.py"
 # =============================================================================
 [tool.pytest.ini_options]
 testpaths        = ["tests"]
+pythonpath       = ["src"]  # 新增：从 platform 目录运行也无需先安装包
 python_files     = ["test_*.py"]
 python_classes   = ["Test*"]
 python_functions = ["test_*"]

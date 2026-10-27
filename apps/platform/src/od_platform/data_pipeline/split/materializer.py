@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding:utf-8 -*-
 # @FileName  : materializer.py
 # @Author    : ODPlatform Team
 # @Project   : ODPlatform
@@ -11,16 +10,17 @@
   2. 删旧只删自己造的叶子目录;删除前 _assert_within 拦围栏(沙盒外/沙盒根/符号链接一律拒绝)
   3. 以 manifest 为准:契约里有什么就落什么,不多不少
 """
+
 from __future__ import annotations
 
 import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
 
 from od_platform.common import paths
 from od_platform.common.lineage import SplitManifest
+from od_platform.common.progress import track
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,7 @@ def _safe_clear(leaf: Path) -> None:
 @dataclass(frozen=True)
 class SplitSourceDirs:
     """raw 侧的图源与标注源。"""
+
     images: Path
     labels: Path
 
@@ -70,20 +71,21 @@ class SplitSourceDirs:
 @dataclass(frozen=True)
 class SplitOutputDirs:
     """processed 侧的成品目录: root/<images|labels>/<split>。"""
+
     root: Path
 
     @property
-    def leaves(self) -> List[Path]:
+    def leaves(self) -> list[Path]:
         return [self.root / kind / s for kind in ("images", "labels") for s in _SPLITS]
 
     @classmethod
-    def for_dataset(cls, dataset: str) -> "SplitOutputDirs":
+    def for_dataset(cls, dataset: str) -> SplitOutputDirs:
         if not dataset or "/" in dataset or "\\" in dataset or dataset.startswith("."):
             raise ValueError(f"非法数据集名: {dataset!r}")
         return cls(paths.dataset_processed_dir(dataset))
 
     @classmethod
-    def under(cls, root: Path) -> "SplitOutputDirs":
+    def under(cls, root: Path) -> SplitOutputDirs:
         return cls(root)
 
 
@@ -92,16 +94,17 @@ def _copy_pair(img: Path, lbl: Path, out: SplitOutputDirs, split: str) -> None:
     shutil.copy2(lbl, out.root / "labels" / split / lbl.name)
 
 
-def materialize(manifest: SplitManifest, source: SplitSourceDirs,
-                out: SplitOutputDirs) -> Dict[str, int]:
+def materialize(
+    manifest: SplitManifest, source: SplitSourceDirs, out: SplitOutputDirs
+) -> dict[str, int]:
     """按 manifest 物化。返回各 split 的样本数。"""
     for leaf in out.leaves:
         _assert_within(paths.PROCESSED_DATA_DIR, leaf)
         _safe_clear(leaf)
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for split in _SPLITS:
         stems = manifest.stems_of(split)
-        for stem in stems:
+        for stem in track(stems, f"materialize:{split}"):
             img, lbl = source.resolve(stem)
             _copy_pair(img, lbl, out, split)
         counts[split] = len(stems)

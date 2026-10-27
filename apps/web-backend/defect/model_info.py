@@ -46,11 +46,7 @@ def _latest_training_run() -> Path | None:
     candidates = completed or [
         path
         for path in TRAINING_RUNS_DIR.iterdir()
-        if path.is_dir()
-        and (
-            (path / "results.csv").exists()
-            or (path / "args.yaml").exists()
-        )
+        if path.is_dir() and ((path / "results.csv").exists() or (path / "args.yaml").exists())
     ]
     if not candidates:
         return None
@@ -137,12 +133,13 @@ def _latest_validation(dataset_name: str) -> dict[str, Any]:
     for report_path in candidates:
         report = _read_json(report_path)
         yaml_path = str(report.get("yaml_path", "")).replace("\\", "/")
-        if dataset_name not in yaml_path:
+        if Path(yaml_path).stem != dataset_name:
             continue
         return {
             "run_id": report.get("run_id"),
             "severity": report.get("overall_severity"),
             "duration_seconds": report.get("duration_seconds"),
+            "n_checks": len(report.get("results", [])),
         }
     return {}
 
@@ -176,11 +173,15 @@ def get_model_overview() -> dict[str, Any]:
     config_values = (audit.get("config", {}) or {}).get("values", {}) or {}
 
     best_path = run_dir / "weights" / "best.pt"
-    archived_weights = sorted(
-        TRAINED_MODELS_DIR.glob("*-best.pt"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    ) if TRAINED_MODELS_DIR.exists() else []
+    archived_weights = (
+        sorted(
+            TRAINED_MODELS_DIR.glob("*-best.pt"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if TRAINED_MODELS_DIR.exists()
+        else []
+    )
     archived_best = archived_weights[0] if archived_weights else None
 
     curve_path = run_dir / "results.png"
@@ -191,7 +192,9 @@ def get_model_overview() -> dict[str, Any]:
         "created_at": audit.get("created_at"),
         "dataset": {
             "name": dataset_name,
-            "classes": [str(value) for _, value in sorted(names.items(), key=lambda item: int(item[0]))],
+            "classes": [
+                str(value) for _, value in sorted(names.items(), key=lambda item: int(item[0]))
+            ],
             "class_count": int(data_yaml.get("nc", len(names)) or len(names)),
             "splits": split.get("counts", {}),
             "strategy": split.get("strategy"),

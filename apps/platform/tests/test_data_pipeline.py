@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-# -*- coding:utf-8 -*-
 # @FileName  : test_data_pipeline.py
 # @Author    : ODPlatform Team
 # @Project   : ODPlatform
 # @Function  : data_pipeline 回归测试
 """data_pipeline 回归测试:七个测试守住本课全部关键语义。"""
+
 import pytest
 
 from od_platform.common import paths
@@ -19,8 +19,7 @@ from od_platform.data_pipeline.split.split_service import split_dataset
 def test_registries_populated():
     """懒加载自动发现:首次查询时注册表已装满。"""
     conv = list_converters()
-    assert set(conv) >= {AnnotationFormat.PASCAL_VOC, AnnotationFormat.COCO,
-                         AnnotationFormat.YOLO}
+    assert set(conv) >= {AnnotationFormat.PASCAL_VOC, AnnotationFormat.COCO, AnnotationFormat.YOLO}
     assert conv[AnnotationFormat.COCO].supports(Task.SEGMENT)
     assert not conv[AnnotationFormat.PASCAL_VOC].supports(Task.SEGMENT)
     strats = list_strategies()
@@ -46,8 +45,7 @@ def test_stratified_requires_labels():
     """分层策略没有 labels_per_image 直接拒跑。"""
     stems = [f"s{i}" for i in range(10)]
     with pytest.raises(ValueError, match="labels_per_image"):
-        split_dataset(stems, strategy=SplitStrategy.STRATIFIED_MULTILABEL,
-                      labels_per_image=None)
+        split_dataset(stems, strategy=SplitStrategy.STRATIFIED_MULTILABEL, labels_per_image=None)
 
 
 def test_stratified_rescues_rare_class():
@@ -56,11 +54,10 @@ def test_stratified_rescues_rare_class():
     labels = {s: ["head"] for s in stems}
     for i in range(12):
         labels[f"rare_{i:03d}"] = ["head", "反光衣"]
-    splits = split_dataset(stems, 0.7, 0.15, 4,
-                           strategy=SplitStrategy.STRATIFIED_MULTILABEL,
-                           labels_per_image=labels)
-    rare_in = {sp: sum(1 for s in ss if "反光衣" in labels[s])
-               for sp, ss in splits.items()}
+    splits = split_dataset(
+        stems, 0.7, 0.15, 4, strategy=SplitStrategy.STRATIFIED_MULTILABEL, labels_per_image=labels
+    )
+    rare_in = {sp: sum(1 for s in ss if "反光衣" in labels[s]) for sp, ss in splits.items()}
     assert all(n >= 1 for n in rare_in.values()), rare_in
 
 
@@ -74,10 +71,17 @@ def test_report_flags_rare():
     assert "head" not in report.rare
 
 
-def test_coverage_gate_rejects_broken():
+def test_coverage_gate_rejects_broken(tmp_path, monkeypatch):
     """覆盖率闸门:10 图 1 标注(10%)低于硬阈值 50%,直接拒跑。"""
-    if not paths.raw_dataset_root("broken").exists():
-        pytest.skip("缺少 data/raw/broken,先跑 scripts/demo_data/make_broken_demo.py")
+    # 新增：自建临时脏集，干净检出时也会执行覆盖率测试。
+    monkeypatch.setattr(paths, "RAW_DATA_DIR", tmp_path)
+    images = tmp_path / "broken" / "images"
+    annotations = tmp_path / "broken" / "annotations"
+    images.mkdir(parents=True)
+    annotations.mkdir()
+    for i in range(10):
+        (images / f"{i}.jpg").touch()
+    (annotations / "0.xml").write_text("<annotation/>", encoding="utf-8")
     pipe = DatasetPipeline("broken", AnnotationFormat.PASCAL_VOC)
     with pytest.raises(ValueError, match="覆盖率"):
         pipe.run()
