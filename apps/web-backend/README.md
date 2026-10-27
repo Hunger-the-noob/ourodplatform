@@ -1,18 +1,23 @@
 # ODPlatform Web
 
-基于 Django 5、Django REST Framework 和 Vue 3 的缺陷检测台账系统。
+Django 5 + Django REST Framework + Vue 3 单页控制台，用于生活垃圾数据理解、
+YOLO 模型训练、测试集评估、模型推理和图片/视频识别。
 
-## 功能
+## 页面模块
 
-- 缺陷记录新增、查看、编辑和删除
-- 原始图片与缺陷标注图上传、预览
-- 缺陷类型筛选、关键字搜索
-- 总记录数、今日记录数、高置信度数量和平均置信度统计
-- 自动展示最新训练任务、mAP、Precision、Recall、类别指标和训练曲线
-- **智能助手**：右侧抽屉对话，基于台账 / 模型指标 / 历史视频分析回答（接任意 OpenAI 兼容接口，无 Key 时退回本地规则模式）
-- **视频智能分析**：上传视频 → 本地 YOLO 抽样推理 → 统计与关键帧 → 大模型中文解读 → 可归档为检测记录
-- Django 模板页面与后台管理
-- 本地 Vue 3.5.44、Axios 1.20.0，无需 Node 或 CDN
+1. 项目介绍：平台能力、工作流与技术架构。
+2. 数据理解：数据划分、类别分布、样本图片和质检查询。
+3. 模型训练：网页启动训练、实时进度/日志、指标图表、数据验证和测试集评估。
+4. 模型推理：单图推理和目标框坐标检查。
+5. 仪表盘：检测记录、识别次数、目标数量和最近活动。
+6. 图片与视频识别：上传生活垃圾图片或视频，显示标注结果和识别历史。
+7. **智能助手**：对话式问答，注入台账 / 模型指标 / 历史视频分析上下文；接任意 OpenAI 兼容接口，
+   未配置 Key 时退回本地规则模式。
+8. **视频智能分析（LLM 解读）**：上传视频 → 本地 YOLO 抽样推理 → 结构化统计与关键帧 →
+   大模型中文报告 → 可一键归档为检测记录。
+
+浏览器标题固定为 `ODPlatform`。Vue 3.5.44 和 Axios 1.20.0 已放入
+`frontend/static/frontend/vendor/`，运行网页不需要 Node 或外部 CDN。
 
 ## 启动
 
@@ -31,42 +36,74 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_web.ps1
 
 访问：
 
-- Vue 工作台：<http://127.0.0.1:8000/>
-- Django 模板列表：<http://127.0.0.1:8000/defect/list/>
-- 后台管理：<http://127.0.0.1:8000/admin/>
-- DRF 接口：<http://127.0.0.1:8000/api/>
+- 控制台：<http://127.0.0.1:8000/>
+- 可指定模块：<http://127.0.0.1:8000/?module=training>
+- Django 后台：<http://127.0.0.1:8000/admin/>
 
-首次使用后台管理前可创建管理员：
+创建后台管理员：
 
 ```powershell
 cd apps\web-backend
 python manage.py createsuperuser
 ```
 
+## 网页训练流程
+
+“模型训练”模块支持：
+
+- 选择 epoch、输入尺寸、batch 和 CPU/GPU
+- 后台异步启动 `odp_platform.cli.train_model`
+- 实时显示任务阶段、进度和最近训练日志
+- 在网页停止训练
+- 数据重新验证
+- 使用独立 test split 执行模型评估
+- 展示 Precision、Recall、mAP50、mAP50-95
+- 展示训练指标曲线、损失曲线、类别 mAP、混淆矩阵和 PR 曲线
+
+训练结束后，最新完整运行记录会自动显示；取消的任务不会覆盖已完成模型指标。
+正式训练建议使用 GPU 和 50–100 个 epoch。
+
+## 核心 API
+
+| 方法 | 地址 | 用途 |
+|---|---|---|
+| GET | `/api/data/` | 数据统计、类别、样本和质检 |
+| POST | `/api/data/validate/` | 重新执行数据验证 |
+| GET/POST | `/api/training/` | 查询状态或启动训练 |
+| POST | `/api/training/cancel/` | 停止训练 |
+| GET | `/api/model/` | 最新模型、历史指标和评估结果 |
+| GET/POST | `/api/model/evaluate/` | 查询或运行测试集评估 |
+| GET | `/api/model/evaluation-artifact/{name}/` | 获取混淆矩阵、PR 曲线 |
+| GET/POST | `/api/recognition/` | 图片识别及历史 |
+| GET/POST | `/api/video-recognition/` | 视频识别及历史 |
+| GET | `/api/dashboard/` | 仪表盘聚合数据 |
+
 ## 代码位置
 
 ```text
 apps/web-backend/
-├── manage.py                         Django 命令入口
+├── manage.py
 ├── .env.example                      大模型 / YOLO 推理配置样例
 ├── config/
 │   ├── settings.py                   数据库、静态文件、CORS、DRF、ASSISTANT 配置
-│   ├── urls.py                       API、后台、模板页面和首页路由
-│   └── views.py                      返回 Vue 首页
+│   ├── urls.py
+│   └── views.py
 ├── defect/
-│   ├── models.py                     DefectType、DefectRecord 数据模型
-│   ├── serializers.py                DRF 序列化器
-│   ├── api_views.py                  缺陷 CRUD 与统计 API
-│   ├── views.py                      Django FBV 页面视图
-│   ├── forms.py                      图片上传表单
-│   ├── admin.py                      Django 后台配置
-│   ├── migrations/                   数据库迁移及默认缺陷类型
-│   └── templates/defect/             Django 模板页面
+│   ├── models.py                     检测、图片识别和视频识别模型
+│   ├── api_views.py                  REST 接口
+│   ├── data_understanding.py         数据统计与样本接口
+│   ├── training_jobs.py              网页训练进程管理
+│   ├── evaluation.py                 test split 评估
+│   ├── recognition.py                图片推理
+│   ├── video_recognition.py          视频推理
+│   ├── model_info.py                 模型、历史和图表数据
+│   ├── serializers.py
+│   ├── admin.py
+│   └── migrations/
 ├── assistant/
 │   ├── models.py                     VideoAnalysisJob 视频分析任务
 │   ├── api_views.py                  meta / chat / video / record 接口
 │   ├── llm.py                        大模型客户端（OpenAI 兼容）
-│   ├── prompts.py                    提示词
 │   ├── context.py                    台账 / 模型 / 历史任务上下文
 │   ├── stats.py                      检测统计聚合
 │   ├── explain.py                    本地规则解释（无 Key 兜底）
@@ -74,28 +111,29 @@ apps/web-backend/
 │   ├── yolo_worker.py                独立进程 YOLO 视频推理 worker
 │   └── tests.py                      单元测试
 └── frontend/
-    ├── index.html                    Vue 工作台页面结构（含助手抽屉、视频面板）
+    ├── index.html                    七模块页面结构（新增“智能助手”模块）
     └── static/frontend/
-        ├── styles.css                页面样式
-        ├── app.js                    Vue 交互与 Axios API 调用
+        ├── app.js                    Vue 状态、训练轮询、识别和图表
         ├── assistant.js              智能助手 + 视频分析前端逻辑
-        └── vendor/                   本地 Vue 与 Axios
+        ├── styles.css
+        └── vendor/
 ```
 
-数据库为 `apps/web-backend/db.sqlite3`，上传图片保存在
-`apps/web-backend/media/`。
+数据库位于 `apps/web-backend/db.sqlite3`，上传结果位于
+`apps/web-backend/media/`。训练任务日志位于 `runs/web_training/`。
 
-## API
+## 边界
+
+- 当前模型是 CPU 上 1 epoch 的演示结果，精度只用于验证功能。
+- 原数据类别名为 `class_0` 到 `class_9`；有真实类别名称后应重新生成数据 YAML。
+- 视频识别最多处理 300 个采样帧，单文件最大 100 MB。
+- 当前是本地开发配置，API 没有登录鉴权。生产环境必须增加认证、关闭 DEBUG、
+  限制 CORS，并使用正式 WSGI/ASGI 服务和任务队列。
+
+## 智能助手 / 视频 LLM 解读 API
 
 | 方法 | 地址 | 用途 |
 |---|---|---|
-| GET | `/api/defect-record/` | 查询记录 |
-| POST | `/api/defect-record/` | 新增记录，使用 multipart/form-data |
-| GET/PATCH/DELETE | `/api/defect-record/{id}/` | 查询、修改、删除单条记录 |
-| GET | `/api/defect-type/` | 查询缺陷类型 |
-| GET | `/api/stats/` | 查询统计概览 |
-| GET | `/api/model/` | 查询最新模型训练结果 |
-| GET | `/api/model/training-curve/` | 获取训练曲线图片 |
 | GET | `/api/assistant/meta/?probe=1` | 大模型配置状态 + 本地 YOLO 环境探测 |
 | POST | `/api/assistant/chat/` | 智能助手对话（注入台账上下文） |
 | GET/POST | `/api/assistant/video/` | 查询最近分析任务 / 上传视频发起分析 |
@@ -105,7 +143,7 @@ apps/web-backend/
 ## Rubbish 数据集训练
 
 ```powershell
-cd C:\Users\DELL\ODPlatform
+cd C:\Users\NAYOUdUO\ourodplatform
 conda activate ODP
 powershell -ExecutionPolicy Bypass -File .\scripts\train_rubbish.ps1
 ```
@@ -118,12 +156,4 @@ powershell -ExecutionPolicy Bypass -File .\scripts\train_rubbish.ps1 `
 ```
 
 训练完成后刷新 Web 页面，“模型训练”区域会自动读取最新运行现场。
-
-当前仓库中的模型是 CPU 上 1 个 epoch 的演示训练结果，只用于验证完整链路，
-不应作为最终精度模型。正式训练建议使用 GPU，并把 `Epochs` 提高到 50–100。
-原数据的类别名为 `class_0` 到 `class_9`；如果已有真实垃圾类别名称，应在
-`odp-transform` 的 `--classes` 参数和重新生成的 YAML 中使用真实名称。
-
-当前为本地开发演示配置，API 未启用登录鉴权，且 CORS 在 `DEBUG=1` 时允许
-所有来源。部署到生产环境前必须关闭 `DEBUG`、配置鉴权、限制 CORS，并使用
-正式 WSGI/ASGI 服务。
+智能助手 / 视频分析的完整说明见 [`docs/assistant-llm-video.md`](../../docs/assistant-llm-video.md)。

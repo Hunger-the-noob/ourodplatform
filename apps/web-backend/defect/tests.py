@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from PIL import Image
 from rest_framework.test import APIClient
 
-from .models import DefectRecord, DefectType
+from .models import (
+    DefectRecord,
+    DefectType,
+    RecognitionRecord,
+    VideoRecognitionRecord,
+)
+from .training_jobs import TrainingJobManager
 
 
 def make_test_image() -> SimpleUploadedFile:
@@ -85,3 +93,140 @@ class DefectApiTests(TestCase):
             response.data["status"],
             {"completed", "training", "not_found"},
         )
+
+    @patch("defect.api_views.recognize_image_file")
+    def test_recognition_upload_and_history(self, recognize_mock):
+        uploaded = make_test_image()
+        image_bytes = uploaded.read()
+        uploaded.seek(0)
+        recognize_mock.return_value = {
+            "original_bytes": image_bytes,
+            "annotated_bytes": image_bytes,
+            "object_count": 2,
+            "model_name": "test-best.pt",
+            "confidence_threshold": 0.3,
+            "iou_threshold": 0.7,
+            "inference_ms": 42.5,
+            "detections": [
+                {
+                    "class_id": 1,
+                    "label": "class_1",
+                    "confidence": 0.91,
+                    "bbox": [1, 2, 30, 40],
+                }
+            ],
+            "class_counts": {"class_1": 2},
+            "width": 80,
+            "height": 60,
+        }
+
+        response = self.client.post(
+            "/api/recognition/",
+            {
+                "image": uploaded,
+                "confidence": "0.3",
+                "iou": "0.7",
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["object_count"], 2)
+        self.assertEqual(response.data["class_counts"], {"class_1": 2})
+        self.assertTrue(response.data["annotated_img_url"].endswith(".jpg"))
+        self.assertEqual(RecognitionRecord.objects.count(), 1)
+
+        history = self.client.get("/api/recognition/")
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(len(history.data), 1)
+        recognize_mock.assert_called_once()
+
+        record_id = response.data["id"]
+        deleted = self.client.delete(f"/api/recognition/{record_id}/")
+        self.assertEqual(deleted.status_code, 204)
+        self.assertEqual(RecognitionRecord.objects.count(), 0)
+
+    def test_recognition_requires_image(self):
+        response = self.client.post("/api/recognition/", {}, format="multipart")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("detail", response.data)
+
+    def test_dataset_and_dashboard_endpoints(self):
+        dataset = self.client.get("/api/data/")
+        self.assertEqual(dataset.status_code, 200)
+        self.assertEqual(dataset.data["class_count"], 10)
+        self.assertGreater(dataset.data["total_images"], 0)
+
+        dashboard = self.client.get("/api/dashboard/")
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn("defects", dashboard.data)
+        self.assertIn("recognition", dashboard.data)
+
+    @patch("defect.api_views.recognize_video_file")
+    def test_video_recognition_history_and_delete(self, recognize_mock):
+        video = SimpleUploadedFile(
+            "sample.mp4",
+            b"fake video content",
+            content_type="video/mp4",
+        )
+        recognize_mock.return_value = {
+            "annotated_bytes": b"fake annotated video",
+            "preview_bytes": b"fake preview",
+            "original_frames": 20,
+            "processed_frames": 10,
+            "object_count": 3,
+            "model_name": "test-best.pt",
+            "confidence_threshold": 0.25,
+            "iou_threshold": 0.7,
+            "inference_ms": 520.0,
+            "class_counts": {"class_2": 3},
+            "detections": [
+                {
+                    "frame": 0,
+                    "label": "class_2",
+                    "confidence": 0.8,
+                    "bbox": [1, 2, 3, 4],
+                }
+            ],
+            "truncated": False,
+        }
+        response = self.client.post(
+            "/api/video-recognition/",
+            {"video": video, "confidence": "0.25", "frame_stride": "2"},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["processed_frames"], 10)
+        self.assertEqual(VideoRecognitionRecord.objects.count(), 1)
+
+        history = self.client.get("/api/video-recognition/")
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(len(history.data), 1)
+
+        deleted = self.client.delete(
+            f"/api/video-recognition/{response.data['id']}/",
+        )
+        self.assertEqual(deleted.status_code, 204)
+        self.assertEqual(VideoRecognitionRecord.objects.count(), 0)
+
+    @patch("defect.training_jobs.subprocess.Popen")
+    def test_training_job_manager_lifecycle(self, popen_mock):
+        process = MagicMock()
+        process.poll.return_value = None
+        popen_mock.return_value = process
+        manager = TrainingJobManager()
+
+        snapshot = manager.start(
+            epochs=1,
+            imgsz=416,
+            batch="16",
+            device="cpu",
+        )
+        self.assertEqual(snapshot["status"], "running")
+        self.assertEqual(snapshot["total_epochs"], 1)
+
+        status = manager.status()
+        self.assertEqual(status["status"], "running")
+
+        cancelled = manager.cancel()
+        self.assertEqual(cancelled["status"], "cancelled")
+        process.terminate.assert_called_once()

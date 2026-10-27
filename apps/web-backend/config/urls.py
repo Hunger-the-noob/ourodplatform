@@ -11,9 +11,21 @@ from config.views import frontend_index
 from defect.api_views import (
     DefectRecordViewSet,
     DefectTypeViewSet,
+    dashboard_overview,
     dashboard_stats,
+    dataset_overview,
+    dataset_sample,
     model_overview,
+    model_evaluation,
+    model_evaluation_artifact,
+    recognition_record_detail,
+    recognition_records,
+    training_cancel,
+    training_control,
     training_curve,
+    validate_dataset,
+    video_recognition_detail,
+    video_recognition_records,
 )
 
 router = DefaultRouter()
@@ -23,11 +35,42 @@ router.register("defect-record", DefectRecordViewSet, basename="defect-record")
 urlpatterns = [
     path("", frontend_index, name="frontend_home"),
     path("admin/", admin.site.urls),
-    path("defect/", include("defect.urls")),
     path("api/assistant/", include("assistant.urls")),
     path("api/stats/", dashboard_stats, name="dashboard-stats"),
+    path("api/dashboard/", dashboard_overview, name="dashboard-overview"),
+    path("api/data/", dataset_overview, name="dataset-overview"),
+    path("api/data/validate/", validate_dataset, name="dataset-validate"),
+    path(
+        "api/data/sample/<str:split>/<str:filename>",
+        dataset_sample,
+        name="dataset-sample",
+    ),
     path("api/model/", model_overview, name="model-overview"),
     path("api/model/training-curve/", training_curve, name="training-curve"),
+    path("api/model/evaluate/", model_evaluation, name="model-evaluate"),
+    path(
+        "api/model/evaluation-artifact/<str:name>/",
+        model_evaluation_artifact,
+        name="model-evaluation-artifact",
+    ),
+    path("api/training/", training_control, name="training-control"),
+    path("api/training/cancel/", training_cancel, name="training-cancel"),
+    path("api/recognition/", recognition_records, name="recognition-records"),
+    path(
+        "api/recognition/<int:record_id>/",
+        recognition_record_detail,
+        name="recognition-record-detail",
+    ),
+    path(
+        "api/video-recognition/",
+        video_recognition_records,
+        name="video-recognition-records",
+    ),
+    path(
+        "api/video-recognition/<int:record_id>/",
+        video_recognition_detail,
+        name="video-recognition-detail",
+    ),
     path("api/", include(router.urls)),
     path(
         "assets/<path:path>",

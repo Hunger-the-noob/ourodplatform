@@ -206,6 +206,7 @@
     // ---------------------------------------------------------------- module
     function create({ notify, getErrorMessage, onArchived }) {
         const assistantOpen = ref(false);
+        const assistantTab = ref("chat");
         const activeNav = ref("ledger");
         const chatMessages = ref([]);
         const chatInput = ref("");
@@ -350,15 +351,6 @@
             if (initialJob) openVideoJob(initialJob);
 
             if (window.location.hash === "#assistant") openAssistant();
-            if (window.location.hash === "#video") scrollToVideo();
-
-            // 宽屏默认展开常驻助手栏，窄屏默认收起（用导航或 ✦ 打开）
-            if (!assistantOpen.value && window.innerWidth >= 1280) {
-                assistantOpen.value = true;
-            }
-
-            window.addEventListener("scroll", scrollSpyHandler, { passive: true });
-            updateActiveNav();
 
             if (videoRuntime.python.available === null) {
                 window.setTimeout(() => probeRuntime(true), 1200);
@@ -599,12 +591,12 @@
         function dispose() {
             stopPolling();
             releaseVideoUrl();
-            window.removeEventListener("scroll", scrollSpyHandler);
         }
 
         return {
             // 助手
             assistantOpen,
+            assistantTab,
             toggleAssistant,
             openAssistant,
             chatMessages,

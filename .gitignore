@@ -39,6 +39,7 @@ Thumbs.db
 # ============================================================
 .pytest_cache/
 .pytest-tmp*/
+.pytest-*/
 apps/web-backend/db.sqlite3
 apps/web-backend/media/
 apps/web-backend/staticfiles/

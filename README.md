@@ -6,7 +6,7 @@
 
 - `apps/platform/` — 核心引擎与 `od-platform` Python 包
 - `apps/desktop/` — PySide6 桌面推理演示
-- `apps/web-backend/` — Django + DRF + Vue 3 缺陷检测工作台（含智能助手、视频智能分析）
+- `apps/web-backend/` — Django + DRF + Vue 3 Web 控制台（数据理解 / 训练 / 评估 / 图片与视频识别 + 智能助手 / 视频 LLM 解读）
 - `data/` — 原始数据与处理产物
 - `models/` — 预训练权重与训练产物
 - `runs/` — 数据、训练与推理运行现场
@@ -40,5 +40,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_desktop.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\run_web.ps1
 python .\scripts\make_demo_video.py --output .\runs\demo\demo.mp4
 ```
+
+Web 工作台还包含生活垃圾图片识别模块：上传图片后调用最新训练权重生成
+标注图、目标明细和识别历史。
 
 完整运行说明见各子项目 README。

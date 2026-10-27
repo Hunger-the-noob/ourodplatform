@@ -38,13 +38,17 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _latest_training_run() -> Path | None:
     if not TRAINING_RUNS_DIR.exists():
         return None
-    candidates = [
+    completed = [
+        path
+        for path in TRAINING_RUNS_DIR.iterdir()
+        if path.is_dir() and (path / "odp_audit.json").exists()
+    ]
+    candidates = completed or [
         path
         for path in TRAINING_RUNS_DIR.iterdir()
         if path.is_dir()
         and (
-            (path / "odp_audit.json").exists()
-            or (path / "results.csv").exists()
+            (path / "results.csv").exists()
             or (path / "args.yaml").exists()
         )
     ]
@@ -74,6 +78,44 @@ def _latest_results_row(run_dir: Path) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return cleaned
+
+
+def _results_history(run_dir: Path) -> list[dict[str, Any]]:
+    results_path = run_dir / "results.csv"
+    if not results_path.exists():
+        return []
+    try:
+        with results_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+    except OSError:
+        return []
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        cleaned: dict[str, float] = {}
+        for raw_key, raw_value in row.items():
+            if raw_key is None or raw_value in (None, ""):
+                continue
+            try:
+                cleaned[raw_key.strip()] = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+        history.append(
+            {
+                "epoch": int(cleaned.get("epoch", len(history) + 1)),
+                "precision": cleaned.get("metrics/precision(B)"),
+                "recall": cleaned.get("metrics/recall(B)"),
+                "map50": cleaned.get("metrics/mAP50(B)"),
+                "map50_95": cleaned.get("metrics/mAP50-95(B)"),
+                "train_box_loss": cleaned.get("train/box_loss"),
+                "train_cls_loss": cleaned.get("train/cls_loss"),
+                "train_dfl_loss": cleaned.get("train/dfl_loss"),
+                "val_box_loss": cleaned.get("val/box_loss"),
+                "val_cls_loss": cleaned.get("val/cls_loss"),
+                "val_dfl_loss": cleaned.get("val/dfl_loss"),
+            }
+        )
+    return history
 
 
 def _metric(metrics: dict[str, Any], *keys: str) -> float | None:
@@ -116,6 +158,7 @@ def get_model_overview() -> dict[str, Any]:
     audit = _read_json(run_dir / "odp_audit.json")
     args = _read_yaml(run_dir / "args.yaml")
     latest_row = _latest_results_row(run_dir)
+    history = _results_history(run_dir)
     completed = bool(audit)
 
     data_yaml_path = Path(str(audit.get("data_yaml", args.get("data", ""))))
@@ -180,6 +223,8 @@ def get_model_overview() -> dict[str, Any]:
             if isinstance(value, (int, float))
         },
         "class_map_50_95": class_maps,
+        "metrics_history": history,
+        "evaluation": _latest_evaluation(),
         "weights": {
             "run_best": best_path.name if best_path.exists() else None,
             "archived": archived_best.name if archived_best else None,
@@ -198,3 +243,9 @@ def latest_training_curve() -> Path | None:
         return None
     curve = run_dir / "results.png"
     return curve if curve.exists() else None
+
+
+def _latest_evaluation() -> dict[str, Any] | None:
+    from .evaluation import latest_evaluation
+
+    return latest_evaluation()

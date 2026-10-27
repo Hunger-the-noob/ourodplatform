@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import mimetypes
 from pathlib import Path
+
+mimetypes.add_type("image/webp", ".webp")
+mimetypes.add_type("video/mp4", ".mp4")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 

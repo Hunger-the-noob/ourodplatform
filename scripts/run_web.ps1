@@ -105,7 +105,7 @@ try {
 
     Write-Host "ODPlatform Web: http://127.0.0.1:$Port/"
     Write-Host "Django Admin:  http://127.0.0.1:$Port/admin/"
-    & $python manage.py runserver "127.0.0.1:$Port"
+    & $python manage.py runserver "127.0.0.1:$Port" --noreload
     exit $LASTEXITCODE
 }
 finally {
