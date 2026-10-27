@@ -170,7 +170,7 @@ class DefectApiTests(TestCase):
 
     def test_dataset_and_dashboard_endpoints(self):
         sample = {"name": "Rubbish_data_set", "class_count": 10, "total_images": 30}
-        with patch("defect.data_api.get_dataset_understanding", return_value=sample):
+        with patch("defect.api_views.get_dataset_understanding", return_value=sample):
             dataset = self.client.get("/api/data/")
         self.assertEqual(dataset.status_code, 200)
         self.assertEqual(dataset.data["class_count"], 10)

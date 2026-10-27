@@ -5,6 +5,8 @@ from defect.api_views import (
     DefectTypeViewSet,
     dashboard_overview,
     dashboard_stats,
+    dataset_overview,
+    dataset_sample,
     model_evaluation,
     model_evaluation_artifact,
     model_overview,
@@ -13,19 +15,17 @@ from defect.api_views import (
     training_cancel,
     training_control,
     training_curve,
+    validate_dataset,
     video_recognition_detail,
     video_recognition_records,
 )
 from defect.data_api import (
     catalog,
-    dataset_overview,
-    dataset_sample,
     job_status,
     report_detail,
     report_download,
     reports,
     transform_dataset,
-    validate_dataset,
 )
 from django.conf import settings
 from django.conf.urls.static import static
@@ -43,6 +43,7 @@ router.register("defect-record", DefectRecordViewSet, basename="defect-record")
 urlpatterns = [
     path("", frontend_index, name="frontend_home"),
     path("admin/", admin.site.urls),
+    path("api/assistant/", include("assistant.urls")),
     path("api/stats/", dashboard_stats, name="dashboard-stats"),
     path("api/dashboard/", dashboard_overview, name="dashboard-overview"),
     path("api/data/", dataset_overview, name="dataset-overview"),

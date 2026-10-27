@@ -39,8 +39,8 @@ createApp({
                 id: "inference",
                 icon: "⌖",
                 label: "模型推理",
-                caption: "MODEL INFERENCE",
-                description: "使用最新权重执行单图推理，并检查每个目标框与置信度。",
+                caption: "SINGLE IMAGE QA",
+                description: "技术验证入口：使用最新权重推理单图，并检查每个目标框坐标与置信度。",
             },
             {
                 id: "dashboard",
@@ -53,8 +53,15 @@ createApp({
                 id: "media",
                 icon: "▷",
                 label: "图片与视频识别",
-                caption: "IMAGE & VIDEO RECOGNITION",
-                description: "上传生活垃圾图片或视频，查看标注结果与识别历史。",
+                caption: "BUSINESS RECOGNITION",
+                description: "业务识别入口：查看生活垃圾图片、视频的标注结果和识别历史。",
+            },
+            {
+                id: "assistant",
+                icon: "✦",
+                label: "智能助手",
+                caption: "AI INSIGHT · LLM",
+                description: "与智能体对话，或上传视频让本地 YOLO 推理并由大模型生成中文解读。",
             },
         ];
 
@@ -247,6 +254,24 @@ createApp({
             });
         };
         const chartPoints = (key) => chartDots(key).map((point) => `${point.x},${point.y}`).join(" ");
+        const lossDots = (kind) => {
+            const history = modelInfo.metrics_history || [];
+            const keys = ["train_box_loss", "train_cls_loss", "train_dfl_loss"];
+            const max = Math.max(
+                ...history.flatMap((row) => keys.map((item) => Number(row[item]) || 0)),
+                1,
+            );
+            const key = `train_${kind}_loss`;
+            const width = 508;
+            const left = 34;
+            return history.map((row, index) => {
+                const x = history.length === 1
+                    ? left + width / 2
+                    : left + (index * width) / (history.length - 1);
+                const value = Number(row[key]) || 0;
+                return { x, y: 190 - (value / max) * 160 };
+            });
+        };
         const lossPoints = (key) => {
             const history = modelInfo.metrics_history || [];
             const keys = ["train_box_loss", "train_cls_loss", "train_dfl_loss"];
@@ -263,6 +288,22 @@ createApp({
                 const value = Number(row[key]) || 0;
                 return `${x},${190 - (value / max) * 160}`;
             }).join(" ");
+        };
+        const historyStartEpoch = computed(() => {
+            const history = modelInfo.metrics_history || [];
+            return history.length ? `E${history[0].epoch}` : "E0";
+        });
+        const historyEndEpoch = computed(() => {
+            const history = modelInfo.metrics_history || [];
+            return history.length ? `E${history[history.length - 1].epoch}` : "En";
+        });
+        const lossValue = (key) => {
+            const value = Number(modelInfo.loss?.[key]);
+            return Number.isFinite(value) ? value.toFixed(4) : "—";
+        };
+        const decimalValue = (value) => {
+            const number = Number(value);
+            return Number.isFinite(number) ? number.toFixed(4) : "—";
         };
 
         const showToast = (message, type = "success") => {
@@ -373,7 +414,10 @@ createApp({
                 showToast(getError(error), "error");
             }
         };
-        const validateDataset = dataTools.validateDataset;
+        // 新增：保留原页面函数入口，在原文件内接入后台质检与进度轮询。
+        const validateDataset = async () => {
+            await dataTools.validateDataset();
+        };
         const evaluateModel = async () => {
             evaluatingModel.value = true;
             try {
@@ -583,16 +627,29 @@ createApp({
             }
         };
 
-        onMounted(async () => { await dataTools.initialize(); await loadAll(); });
+        // 智能助手（4.1 对话）+ 视频 YOLO 推理大模型解读（4.2）
+        const assistant = window.AssistantModule.create({
+            notify: showToast,
+            getErrorMessage: getError,
+            onArchived: () => loadAll(false),
+        });
+
+        onMounted(async () => {
+            await dataTools.initialize();
+            await loadAll();
+            assistant.init();
+        });
         onBeforeUnmount(() => {
             dataTools.dispose();
             if (trainingPollTimer) window.clearTimeout(trainingPollTimer);
             if (toast.timer) window.clearTimeout(toast.timer);
             [inferencePreview, mediaImagePreview, mediaVideoPreview].forEach((item) => releaseUrl(item.value));
+            assistant.dispose();
         });
 
         return {
             ...dataTools,
+            ...assistant,
             modules,
             activeModule,
             currentModule,
@@ -644,6 +701,11 @@ createApp({
             chartPoints,
             chartDots,
             lossPoints,
+            lossDots,
+            historyStartEpoch,
+            historyEndEpoch,
+            lossValue,
+            decimalValue,
             loadAll,
             refreshAll,
             startTraining,

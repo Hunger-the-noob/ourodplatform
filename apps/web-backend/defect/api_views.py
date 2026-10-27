@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 from collections import Counter
 from pathlib import Path
 from uuid import uuid4
@@ -13,10 +14,12 @@ from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
+from .data_api import ValidationOptions
+from .data_api import _name as _data_name
+from .data_api import _start as _start_data_job
 from .data_jobs import data_jobs
-from .data_understanding import (
-    get_dataset_understanding,
-)
+from .data_understanding import DATASET_YAML as DATASET_YAML
+from .data_understanding import dataset_sample_path, get_dataset_understanding
 from .evaluation import evaluation_artifact, latest_evaluation, run_test_evaluation
 from .model_info import get_model_overview, latest_training_curve
 from .models import (
@@ -109,6 +112,34 @@ def training_curve(request):
     if curve is None:
         return Response({"detail": "暂无训练曲线图。"}, status=404)
     return FileResponse(curve.open("rb"), content_type="image/png")
+
+
+# 新增：数据集选择与异步质检仍通过本文件原有的接口入口接入。
+@api_view(["GET"])
+def dataset_overview(request):
+    try:
+        return Response(get_dataset_understanding(_data_name(request)))
+    except ValueError as error:
+        return Response({"detail": str(error)}, status=400)
+
+
+@api_view(["GET"])
+def dataset_sample(request, split: str, filename: str):
+    try:
+        sample = dataset_sample_path(split, filename, _data_name(request))
+    except ValueError as error:
+        return Response({"detail": str(error)}, status=400)
+    if sample is None:
+        return Response({"detail": "样本图片不存在。"}, status=404)
+    # 新增：保留原样本接口，并支持各类图片的正确响应类型。
+    content_type = mimetypes.guess_type(sample.name)[0] or "image/jpeg"
+    return FileResponse(sample.open("rb"), content_type=content_type)
+
+
+@api_view(["POST"])
+def validate_dataset(request):
+    # 修改：原有质检入口改为启动后台任务，使页面能够持续读取实际进度。
+    return _start_data_job("validate", ValidationOptions, request)
 
 
 @api_view(["GET", "POST"])

@@ -1,7 +1,6 @@
 """Web 数据任务与质检报告接口。"""
 
 import math
-import mimetypes
 
 from django.http import FileResponse
 from rest_framework import serializers
@@ -11,7 +10,6 @@ from rest_framework.response import Response
 from .data_catalog import DEFAULT_DATASET, dataset_catalog, dataset_yaml
 from .data_jobs import data_jobs
 from .data_reports import get_report, list_reports, report_path
-from .data_understanding import dataset_sample_path, get_dataset_understanding
 from .training_jobs import training_jobs
 
 
@@ -77,26 +75,17 @@ def catalog(request):
     return Response({"datasets": dataset_catalog()})
 
 
-@api_view(["GET"])
+# 兼容入口：原有接口的实际定义保留在 api_views.py，本文件只实现新增接口。
 def dataset_overview(request):
-    try:
-        return Response(get_dataset_understanding(_name(request)))
-    except ValueError as error:
-        return Response({"detail": str(error)}, status=400)
+    from .api_views import dataset_overview as original_view
+
+    return original_view(getattr(request, "_request", request))
 
 
-@api_view(["GET"])
 def dataset_sample(request, split, filename):
-    try:
-        path = dataset_sample_path(split, filename, _name(request))
-    except ValueError as error:
-        return Response({"detail": str(error)}, status=400)
-    if path is None:
-        return Response({"detail": "样本图片不存在。"}, status=404)
-    return FileResponse(
-        path.open("rb"),
-        content_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
-    )
+    from .api_views import dataset_sample as original_view
+
+    return original_view(getattr(request, "_request", request), split=split, filename=filename)
 
 
 def _start(action, serializer, request):
@@ -120,9 +109,10 @@ def transform_dataset(request):
     return _start("transform", TransformOptions, request)
 
 
-@api_view(["POST"])
 def validate_dataset(request):
-    return _start("validate", ValidationOptions, request)
+    from .api_views import validate_dataset as original_view
+
+    return original_view(getattr(request, "_request", request))
 
 
 @api_view(["GET"])

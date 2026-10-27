@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<!-- 阅读副本：ODPlatform 页面结构；真正运行文件位于 apps/web-backend/frontend/index.html。 -->
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="ODPlatform 模型训练与视觉识别平台">
+    <title>ODPlatform</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+<div id="app" class="app" v-cloak>
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="brand-mark"><span></span>OD</div>
+            <div><strong>ODPlatform</strong><small>Model &amp; Vision</small></div>
+        </div>
+        <nav class="nav">
+            <button v-for="item in modules" :key="item.id" type="button"
+                    class="nav-item" :class="{ active: activeModule === item.id }"
+                    @click="activeModule = item.id">
+                <span class="nav-icon">{{ item.icon }}</span>
+                <span><b>{{ item.label }}</b><small>{{ item.caption }}</small></span>
+            </button>
+        </nav>
+        <div class="side-status">
+            <div><span class="dot" :class="{ offline: !apiOnline }"></span>{{ apiOnline ? "API 在线" : "API 离线" }}</div>
+            <small>YOLO · Django · Vue</small>
+        </div>
+    </aside>
+
+    <main class="main">
+        <header class="topbar">
+            <div>
+                <p class="eyebrow">{{ currentModule.caption }}</p>
+                <h1>{{ currentModule.label }}</h1>
+                <p>{{ currentModule.description }}</p>
+            </div>
+            <div class="top-actions">
+                <button class="icon-btn" type="button" title="刷新" @click="refreshAll">
+                    <span :class="{ spin: pageLoading }">↻</span>
+                </button>
+                <a class="ghost-btn" href="/admin/" target="_blank" rel="noreferrer">后台管理</a>
+            </div>
+        </header>
+
+        <section class="module" v-show="activeModule === 'intro'">
+            <div class="intro-hero">
+                <div>
+                    <span class="pill">ODPlatform / END-TO-END VISION</span>
+                    <h2>从数据到模型，再到识别结果</h2>
+                    <p>ODPlatform 把生活垃圾数据质检、YOLO 训练、指标评估、模型推理和识别记录整合在一个网页中。</p>
+                    <div class="hero-actions">
+                        <button class="primary" @click="activeModule='training'">开始模型训练</button>
+                        <button class="secondary" @click="activeModule='understanding'">查看数据</button>
+                    </div>
+                </div>
+                <div class="intro-orbit" aria-hidden="true">
+                    <div class="orbit-ring ring-a"></div><div class="orbit-ring ring-b"></div>
+                    <div class="orbit-core">AI</div>
+                    <span class="orbit-label l1">DATA</span><span class="orbit-label l2">TRAIN</span>
+                    <span class="orbit-label l3">VALIDATE</span><span class="orbit-label l4">INFER</span>
+                </div>
+            </div>
+            <div class="kpi-grid four">
+                <article class="kpi"><span>数据集</span><b>{{ dataset.name || "Rubbish_data_set" }}</b><small>生活垃圾检测数据</small></article>
+                <article class="kpi"><span>图片数量</span><b>{{ formatNumber(dataset.total_images) }}</b><small>训练 / 验证 / 测试</small></article>
+                <article class="kpi"><span>模型状态</span><b>{{ modelStatusLabel }}</b><small>{{ modelInfo.run_id || "尚未训练" }}</small></article>
+                <article class="kpi"><span>mAP@50</span><b>{{ metricPercent(modelInfo.metrics.map50) }}</b><small>当前最佳模型</small></article>
+            </div>
+            <div class="section-card">
+                <div class="section-head"><div><h2>平台工作流</h2><p>七个入口覆盖数据、训练、评估、推理、归档和智能解读。</p></div></div>
+                <div class="flow">
+                    <div><span>01</span><b>数据理解</b><small>分布、标注、质检</small></div><i>→</i>
+                    <div><span>02</span><b>模型训练</b><small>网页启动实时训练</small></div><i>→</i>
+                    <div><span>03</span><b>验证评估</b><small>测试集独立评估</small></div><i>→</i>
+                    <div><span>04</span><b>模型推理</b><small>单图技术验证</small></div><i>→</i>
+                    <div><span>05</span><b>结果归档</b><small>识别历史与检测记录</small></div>
+                </div>
+            </div>
+            <div class="feature-grid">
+                <article v-for="item in modules.slice(1)" :key="item.id" class="feature-card" @click="activeModule = item.id">
+                    <span class="feature-icon">{{ item.icon }}</span>
+                    <h3>{{ item.label }}</h3>
+                    <p>{{ item.description }}</p>
+                    <b>打开模块 →</b>
+                </article>
+            </div>
+        </section>
+
+        <section class="module" v-show="activeModule === 'understanding'">
+            <div class="section-card data-workbench">
+                <div class="section-head data-toolbar">
+                    <div><h2>数据工程工作台</h2><p>构建数据集、查看实时进度，并追踪每次质检的问题变化。</p></div>
+                    <label class="field dataset-select">当前数据集
+                        <select v-model="selectedDataset" @change="selectDataset" :disabled="dataBusy" aria-label="当前数据集">
+                            <option v-for="item in datasetOptions" :key="item.name" :value="item.name">{{ item.name }}</option>
+                            <option v-if="!datasetOptions.length" :value="selectedDataset">暂无本地数据集</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="data-actions">
+                    <button class="secondary" @click="transformDataset" :disabled="dataBusy || trainingRunning || !currentDataset?.has_raw">构建数据集</button>
+                    <button class="primary" @click="validateDataset" :disabled="dataBusy || !currentDataset?.has_config">{{ validatingData ? '正在质检…' : '运行 16 项质检' }}</button>
+                    <span class="hint" v-if="currentDataset">{{ currentDataset.task === 'segment' ? '分割任务' : '检测任务' }} · {{ currentDataset.format.toUpperCase() }} · 固定种子 {{ transformForm.seed }}</span>
+                </div>
+                <p v-if="!currentDataset?.has_raw" class="data-notice">本机尚无该数据集的原始图片，准备好原始数据后即可构建。</p>
+                <p v-if="dataset.message" class="data-notice">{{ dataset.message }}</p>
+                <details class="data-settings">
+                    <summary>流水线与质检配置</summary>
+                    <div class="two-grid">
+                        <div>
+                            <h3>流水线参数</h3>
+                            <div class="field-pair">
+                                <label class="field">原始标注格式<select v-model="transformForm.format" :disabled="dataBusy"><option value="yolo">YOLO</option><option value="pascal_voc">Pascal VOC</option><option value="coco">COCO</option></select></label>
+                                <label class="field">任务类型<select v-model="transformForm.task" :disabled="dataBusy"><option value="detect">目标检测</option><option value="segment">实例分割</option></select></label>
+                                <label class="field">划分策略<select v-model="transformForm.split_strategy" :disabled="dataBusy"><option value="random">随机划分</option><option value="stratified_multilabel">多标签分层划分</option></select></label>
+                                <label class="field">随机种子<input type="number" min="0" step="1" v-model="transformForm.seed" :disabled="dataBusy"></label>
+                                <label class="field">训练集比例<input type="number" min="0.01" max="1" step="0.01" v-model="transformForm.train_rate" :disabled="dataBusy"></label>
+                                <label class="field">验证集比例<input type="number" min="0" max="0.99" step="0.01" v-model="transformForm.val_rate" :disabled="dataBusy"></label>
+                            </div>
+                            <label class="field">类别名称（按类别 ID 顺序，以逗号分隔）<textarea rows="2" v-model="transformForm.classes" :disabled="dataBusy" placeholder="YOLO 必填，例如：纸张, 塑料, 金属"></textarea></label>
+                            <p class="hint">测试集比例自动取剩余部分。构建会更新成品数据，原始数据保留。</p>
+                        </div>
+                        <div>
+                            <h3>历史对比</h3>
+                            <label class="field">对比方式<select aria-label="对比方式" v-model="compareMode" :disabled="dataBusy"><option value="auto">自动对比最近一次有效报告</option><option value="specific">选择历史基线</option><option value="off">本次不进行对比</option></select></label>
+                            <label v-if="compareMode === 'specific'" class="field">历史基线<select aria-label="历史基线" v-model="baselineRunId" :disabled="dataBusy"><option value="">请选择历史报告</option><option v-for="item in reportHistory.filter(row => row.baseline_compatible)" :key="item.run_id" :value="item.run_id">{{ item.run_id }} · {{ item.severity }}</option></select></label>
+                            <p class="hint">对比仅使用相同数据配置、数据根目录和任务的报告。首跑会建立基线；缺少数据身份的旧版报告仍可查看。</p>
+                            <p class="hint">质检覆盖图片能否解码、标签结构、归一化坐标、类别 ID 范围、目标框边界和样本 SHA256 等 16 项检查。</p>
+                        </div>
+                    </div>
+                </details>
+                <p v-if="dataError" class="error-text data-error" role="alert">{{ dataError }}</p>
+                <p v-if="pollWarning" class="data-notice" role="status">{{ pollWarning }}</p>
+            </div>
+            <div v-if="dataJob.status !== 'idle'" class="section-card data-task" :class="{ 'task-failed': dataJob.status === 'failed' }" aria-live="polite">
+                <div class="section-head">
+                    <div><span class="eyebrow">{{ dataJob.action === 'transform' ? '数据流水线' : '数据质检' }} · {{ dataJob.dataset }}</span><h2>{{ dataStageLabel }}</h2><p>{{ dataJob.status === 'running' ? '当前阶段的实际完成量；进入下一阶段时进度重新计数。' : dataJob.status === 'completed' ? '任务已完成，结果已保存。' : dataJob.error }}</p></div>
+                    <strong class="data-percentage">{{ dataJob.progress === null ? '处理中' : `${Math.round(dataJob.progress || 0)}%` }}</strong>
+                </div>
+                <div class="progress" role="progressbar" :aria-label="dataStageLabel" :aria-valuenow="dataJob.progress ?? undefined" aria-valuemin="0" aria-valuemax="100"><i :class="{ indeterminate: dataJob.progress === null }" :style="{ width: `${dataJob.progress ?? 25}%` }"></i></div>
+                <div v-if="dataJob.progress_event" class="data-progress-meta"><span>{{ formatNumber(dataJob.progress_event.completed) }} / {{ dataJob.progress_event.total === null ? '未知总量' : formatNumber(dataJob.progress_event.total) }} 项</span><span>{{ dataJob.progress_event.rate }} 项/秒</span><span>{{ dataJob.progress_event.eta_seconds === null ? '正在计算剩余时间' : `预计剩余 ${dataJob.progress_event.eta_seconds} 秒` }}</span></div>
+                <details v-if="dataJob.logs?.length" class="task-log"><summary>查看任务日志</summary><pre class="console">{{ dataJob.logs.join('\n') }}</pre></details>
+            </div>
+            <div class="section-card quality-report">
+                <div class="section-head data-report-head">
+                    <div><h2>质检明细与历史对比</h2><p>每次检查都有结论和证据，坏图或标签问题可直接定位。</p></div>
+                    <label class="field report-select">查看报告<select aria-label="查看报告" v-model="selectedReportId" @change="loadReport" :disabled="reportLoading"><option value="">暂无质检报告</option><option v-for="item in reportHistory" :key="item.run_id" :value="item.run_id">{{ item.run_id }} · {{ item.severity }}</option></select></label>
+                </div>
+                <div v-if="reportLoading" class="empty-line">正在读取质检报告…</div>
+                <div v-else-if="!validationReport" class="module-empty small-empty"><b>还没有当前数据集的质检报告</b><span>点击“运行 16 项质检”，完成后在这里查看逐项结果。</span></div>
+                <template v-else>
+                    <div class="quality-summary"><span class="quality-badge" :class="severityClass(validationReport.severity)">{{ validationReport.severity }}</span><span>{{ validationReport.results.length }} 项检查 · {{ validationReport.duration_seconds }} 秒</span><div class="report-downloads"><a v-if="validationReport.downloads?.json" :href="validationReport.downloads.json">下载 JSON</a><a v-if="validationReport.downloads?.csv" :href="validationReport.downloads.csv">下载 CSV</a><a v-if="validationReport.downloads?.comparison" :href="validationReport.downloads.comparison">下载对比 CSV</a></div></div>
+                    <div v-if="validationReport.comparison" class="quality-comparison">
+                        <p>对比基线：<b>{{ validationReport.comparison.baseline_run_id }}</b><span class="hint"> · 按质检项对比</span></p>
+                        <div class="comparison-stats"><div v-for="group in comparisonGroups" :key="group.key" :class="severityClass(group.tone)"><b>{{ group.rows.length }}</b><span>{{ group.label }}</span></div></div>
+                        <details v-for="group in comparisonGroups.filter(item => item.rows.length)" :key="group.key" class="comparison-group"><summary>{{ group.label }}（{{ group.rows.length }}）</summary><div v-for="item in group.rows" :key="item.check" class="comparison-row"><b>{{ checkLabel(item.check) }}</b><span>{{ item.previous?.severity || '未检查' }} → {{ item.current.severity }}</span><p>{{ item.current.summary }}</p></div></details>
+                        <p v-if="validationReport.comparison.added_checks?.length || validationReport.comparison.removed_checks?.length" class="hint">新增检查：{{ validationReport.comparison.added_checks.map(checkLabel).join('、') || '无' }}；移除检查：{{ validationReport.comparison.removed_checks.map(checkLabel).join('、') || '无' }}。移除检查不计为问题修复。</p>
+                    </div>
+                    <p v-else class="data-notice">本报告没有历史对比。首次质检、关闭对比或旧版报告都会出现此状态。</p>
+                    <div class="quality-filters" aria-label="按质检级别筛选"><button :class="{ active: severityFilter === 'all' }" @click="severityFilter = 'all'">全部 {{ validationReport.results.length }}</button><button v-for="level in ['ERROR', 'WARNING', 'INFO', 'PASS']" :key="level" :class="[severityClass(level), { active: severityFilter === level }]" @click="severityFilter = level">{{ level }} {{ checkCounts[level] }}</button></div>
+                    <div class="quality-checks"><details v-for="item in checks" :key="selectedReportId + item.name" class="quality-check"><summary><span class="quality-badge" :class="severityClass(item.severity)">{{ item.severity }}</span><b>{{ checkLabel(item.name) }}</b><span class="check-summary">{{ item.summary }}</span></summary><div class="check-evidence"><p>问题明细与检查依据</p><pre>{{ prettyEvidence(item.details) }}</pre></div></details><p v-if="!checks.length" class="empty-line">本次没有此级别的检查结果。</p></div>
+                </template>
+            </div>
+
+            <div class="section-card">
+                <div class="section-head">
+                    <div><h2>{{ selectedDataset }} 数据概览</h2><p>数据划分、类别分布和标注质量；质检入口统一放在页面上方，避免重复操作。</p></div>
+                </div>
+                <div class="kpi-grid four compact">
+                    <article class="kpi"><span>图片数量</span><b>{{ formatNumber(dataset.total_images) }}</b><small>当前目录实际图片数量</small></article>
+                    <article class="kpi"><span>目标框</span><b>{{ formatNumber(dataset.total_boxes) }}</b><small>检测实例总数</small></article>
+                    <article class="kpi"><span>类别数</span><b>{{ dataset.class_count || 0 }}</b><small>{{ (dataset.classes || []).join(" · ") }}</small></article>
+                    <article class="kpi"><span>质检结论</span><b :class="severityClass(dataset.validation?.severity)">{{ dataset.validation?.severity || "—" }}</b><small>{{ dataset.strategy || "固定划分" }}</small></article>
+                </div>
+                <div class="two-grid">
+                    <article class="chart-card">
+                        <div class="chart-title"><div><h3>数据划分</h3><p>固定种子 {{ dataset.seed ?? "—" }} 生成，用于可重复训练。</p></div></div>
+                        <div class="split-visual">
+                            <div class="donut" :style="{ background: splitGradient }"><span>{{ formatNumber(dataset.total_images) }}<small>图片</small></span></div>
+                            <div class="legend">
+                                <div><i class="train"></i><span>训练集</span><b>{{ dataset.splits?.train?.images || 0 }}</b></div>
+                                <div><i class="val"></i><span>验证集</span><b>{{ dataset.splits?.val?.images || 0 }}</b></div>
+                                <div><i class="test"></i><span>测试集</span><b>{{ dataset.splits?.test?.images || 0 }}</b></div>
+                            </div>
+                        </div>
+                    </article>
+                    <article class="chart-card">
+                        <div class="chart-title"><div><h3>类别实例分布</h3><p>比较各类别实例数量，识别样本不足与长尾分布。</p></div></div>
+                        <div class="bar-chart">
+                            <div v-for="item in classRows" :key="item.label" class="bar-row">
+                                <span>{{ item.label }}</span><i><em :style="{ width: barPercent(item.count, classRows) }"></em></i><b>{{ item.count }}</b>
+                            </div>
+                        </div>
+                    </article>
+                </div>
+                <div class="chart-note">
+                    <b>如何理解：</b>训练集用于学习参数；验证集用于选择最佳 epoch；测试集只用于最终评估。类别数量越均衡，模型越不容易偏向数量最多的垃圾类别。
+                </div>
+            </div>
+            <div class="section-card">
+                <div class="section-head"><div><h2>数据样本</h2><p>来自已处理数据集的训练、验证和测试样本。</p></div></div>
+                <div class="sample-grid">
+                    <figure v-for="item in dataset.samples" :key="item.split + item.name">
+                        <img :src="item.url" :alt="item.name" loading="lazy">
+                        <figcaption><span>{{ item.split.toUpperCase() }}</span>{{ item.name }}</figcaption>
+                    </figure>
+                </div>
+            </div>
+            <div class="section-card pipeline-card">
+                <div class="section-head"><div><h2>数据流水线</h2><p>当前数据已经冻结，训练不会重新随机划分。</p></div></div>
+                <div class="pipeline">
+                    <div><b>RAW</b><span>原始 YOLO 图片与标签</span></div><i>→</i>
+                    <div><b>TRANSFORM</b><span>格式校验、固定划分、物化</span></div><i>→</i>
+                    <div><b>VALIDATE</b><span>16 项质量检查（含图片解码）</span></div><i>→</i>
+                    <div><b>READY</b><span>可重复训练的数据集 YAML</span></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="module" v-show="activeModule === 'training'">
+            <div class="training-layout">
+                <aside class="control-card">
+                    <div class="card-title"><span>QUICK TRAIN</span><h2>训练配置</h2><p>网页提交后由 Django 在后台启动训练进程。</p></div>
+                    <label class="field"><span>数据集</span><input value="Rubbish_data_set" disabled></label>
+                    <div class="field-pair">
+                        <label class="field"><span>Epochs</span><input v-model.number="trainingForm.epochs" type="number" min="1" max="200"></label>
+                        <label class="field"><span>图像尺寸</span><select v-model.number="trainingForm.imgsz"><option :value="320">320</option><option :value="416">416</option><option :value="640">640</option></select></label>
+                    </div>
+                    <div class="field-pair">
+                        <label class="field"><span>Batch</span><input v-model="trainingForm.batch" type="number" min="1" max="64"></label>
+                        <label class="field"><span>设备</span><select v-model="trainingForm.device"><option value="cpu">CPU</option><option value="0">GPU 0</option></select></label>
+                    </div>
+                    <div class="control-actions">
+                        <button class="primary" @click="startTraining" :disabled="trainingRunning">开始训练</button>
+                        <button class="danger-btn" v-if="trainingRunning" @click="cancelTraining">停止</button>
+                    </div>
+                    <p class="hint">当前设备无 CUDA 时请选择 CPU。CPU 训练速度较慢，但网页可实时查看日志。</p>
+                </aside>
+                <div class="training-main">
+                    <div class="training-status-card" :class="trainingState.status">
+                        <div class="status-head">
+                            <div><span>训练任务</span><h3>{{ trainingStageLabel }}</h3><small>{{ trainingState.id || "尚未启动" }}</small></div>
+                            <strong>{{ trainingState.progress || 0 }}%</strong>
+                        </div>
+                        <div class="progress"><i :style="{ width: (trainingState.progress || 0) + '%' }"></i></div>
+                        <div class="progress-meta">
+                            <span>Epoch {{ trainingState.current_epoch || 0 }} / {{ trainingState.total_epochs || trainingForm.epochs }}</span>
+                            <span>{{ trainingState.imgsz || trainingForm.imgsz }} px · batch {{ trainingState.batch || trainingForm.batch }}</span>
+                        </div>
+                        <pre class="console" v-if="trainingState.logs?.length">{{ trainingState.logs.join("\n") }}</pre>
+                        <p v-else class="empty-line">启动训练后，这里会显示实时日志。</p>
+                    </div>
+                    <div class="kpi-grid four compact">
+                        <article class="kpi"><span>mAP@50</span><b>{{ metricPercent(modelInfo.metrics.map50) }}</b><small>综合检测能力</small></article>
+                        <article class="kpi"><span>mAP@50-95</span><b>{{ metricPercent(modelInfo.metrics.map50_95) }}</b><small>严格 IoU 指标</small></article>
+                        <article class="kpi"><span>Precision</span><b>{{ metricPercent(modelInfo.metrics.precision) }}</b><small>预测框中正确的比例</small></article>
+                        <article class="kpi"><span>Recall</span><b>{{ metricPercent(modelInfo.metrics.recall) }}</b><small>真实目标被找回的比例</small></article>
+                    </div>
+                    <div class="two-grid charts-grid">
+                        <article class="chart-card chart-card-wide">
+                            <div class="chart-title"><div><h3>检测指标趋势</h3><p>曲线越高越好；三条线分别表示 Precision、Recall 和 mAP@50。</p></div></div>
+                            <svg class="line-chart" viewBox="0 0 560 220">
+                                <text x="4" y="30" class="axis-label">100%</text>
+                                <text x="7" y="110" class="axis-label">50%</text>
+                                <text x="12" y="190" class="axis-label">0%</text>
+                                <line v-for="y in [30,70,110,150,190]" :key="y" x1="34" :y1="y" x2="542" :y2="y" class="grid-line"/>
+                                <polyline :points="chartPoints('precision')" class="line precision-line"/>
+                                <polyline :points="chartPoints('recall')" class="line recall-line"/>
+                                <polyline :points="chartPoints('map50')" class="line map-line"/>
+                                <circle v-for="p in chartDots('precision')" :key="'p'+p.x+p.y" :cx="p.x" :cy="p.y" r="3" class="precision-dot"/>
+                                <circle v-for="p in chartDots('recall')" :key="'r'+p.x+p.y" :cx="p.x" :cy="p.y" r="3" class="recall-dot"/>
+                                <circle v-for="p in chartDots('map50')" :key="'m'+p.x+p.y" :cx="p.x" :cy="p.y" r="3" class="map-dot"/>
+                                <text x="34" y="214" class="axis-label">{{ historyStartEpoch }}</text>
+                                <text x="510" y="214" class="axis-label">{{ historyEndEpoch }}</text>
+                            </svg>
+                            <div class="chart-metric-strip">
+                                <span><i class="precision-line"></i>Precision <b>{{ metricPercent(modelInfo.metrics.precision) }}</b></span>
+                                <span><i class="recall-line"></i>Recall <b>{{ metricPercent(modelInfo.metrics.recall) }}</b></span>
+                                <span><i class="map-line"></i>mAP@50 <b>{{ metricPercent(modelInfo.metrics.map50) }}</b></span>
+                            </div>
+                        </article>
+                        <article class="chart-card chart-card-wide">
+                            <div class="chart-title"><div><h3>训练损失</h3><p>损失越低越好；box 定位、cls 分类、dfl 边框分布三条曲线共同判断模型是否收敛。</p></div></div>
+                            <svg class="line-chart" viewBox="0 0 560 220">
+                                <text x="4" y="30" class="axis-label">最大</text>
+                                <text x="12" y="190" class="axis-label">0</text>
+                                <line v-for="y in [30,70,110,150,190]" :key="y" x1="34" :y1="y" x2="542" :y2="y" class="grid-line"/>
+                                <polyline :points="lossPoints('train_box_loss')" class="line box-loss"/>
+                                <polyline :points="lossPoints('train_cls_loss')" class="line cls-loss"/>
+                                <polyline :points="lossPoints('train_dfl_loss')" class="line dfl-loss"/>
+                                <circle v-for="p in lossDots('box')" :key="'b'+p.x+p.y" :cx="p.x" :cy="p.y" r="3" class="box-dot"/>
+                                <circle v-for="p in lossDots('cls')" :key="'c'+p.x+p.y" :cx="p.x" :cy="p.y" r="3" class="cls-dot"/>
+                                <circle v-for="p in lossDots('dfl')" :key="'d'+p.x+p.y" :cx="p.x" :cy="p.y" r="3" class="dfl-dot"/>
+                                <text x="34" y="214" class="axis-label">{{ historyStartEpoch }}</text>
+                                <text x="510" y="214" class="axis-label">{{ historyEndEpoch }}</text>
+                            </svg>
+                            <div class="chart-metric-strip">
+                                <span><i class="box-loss"></i>Box <b>{{ lossValue("box_loss") }}</b></span>
+                                <span><i class="cls-loss"></i>Class <b>{{ lossValue("cls_loss") }}</b></span>
+                                <span><i class="dfl-loss"></i>DFL <b>{{ lossValue("dfl_loss") }}</b></span>
+                            </div>
+                        </article>
+                    </div>
+                    <div class="two-grid">
+                        <article class="chart-card">
+                            <div class="chart-title"><div><h3>类别 mAP@50-95</h3><p>找出表现最差的类别，决定补充数据或继续训练。</p></div></div>
+                            <div class="bar-chart">
+                                <div v-for="item in classMapRows" :key="item.name" class="bar-row">
+                                    <span>{{ item.name }}</span><i><em :style="{ width: metricPercent(item.value) }"></em></i><b>{{ metricPercent(item.value) }}</b>
+                                </div>
+                            </div>
+                        </article>
+                        <article class="chart-card evaluation-card">
+                            <div class="chart-title"><div><h3>测试集评估</h3><p>只使用未参与训练的 test split，验证模型泛化能力。</p></div><button class="secondary small" @click="evaluateModel" :disabled="evaluatingModel">{{ evaluatingModel ? "评估中..." : "运行测试集评估" }}</button></div>
+                            <div v-if="modelInfo.evaluation" class="eval-metrics">
+                                <div><span>mAP@50</span><b>{{ metricPercent(modelInfo.evaluation.metrics?.map50) }}</b></div>
+                                <div><span>mAP@50-95</span><b>{{ metricPercent(modelInfo.evaluation.metrics?.map50_95) }}</b></div>
+                                <div><span>Precision</span><b>{{ metricPercent(modelInfo.evaluation.metrics?.precision) }}</b></div>
+                                <div><span>Recall</span><b>{{ metricPercent(modelInfo.evaluation.metrics?.recall) }}</b></div>
+                            </div>
+                            <div v-else class="module-empty small-empty"><b>尚无测试集评估</b><span>点击按钮生成混淆矩阵与 PR 曲线。</span></div>
+                            <div class="eval-charts" v-if="modelInfo.evaluation?.artifacts">
+                                <figure v-if="modelInfo.evaluation.artifacts['confusion_matrix.png']">
+                                    <img :src="modelInfo.evaluation.artifacts['confusion_matrix.png']" alt="混淆矩阵">
+                                    <figcaption>混淆矩阵：对角线越深，分类越准确</figcaption>
+                                </figure>
+                                <figure v-if="modelInfo.evaluation.artifacts['BoxPR_curve.png']">
+                                    <img :src="modelInfo.evaluation.artifacts['BoxPR_curve.png']" alt="PR曲线">
+                                    <figcaption>PR 曲线：曲线下面积越大越好</figcaption>
+                                </figure>
+                            </div>
+                        </article>
+                    </div>
+                    <div class="section-card metric-history-card" v-if="modelInfo.metrics_history?.length">
+                        <div class="section-head"><div><h2>逐轮指标明细</h2><p>保留所有 epoch 的 Precision、Recall、mAP 与损失，便于检查收敛过程。</p></div><span class="history-count">{{ modelInfo.metrics_history.length }} 个 epoch</span></div>
+                        <div class="metric-table-wrap">
+                            <table class="metric-table">
+                                <thead><tr><th>Epoch</th><th>Precision</th><th>Recall</th><th>mAP@50</th><th>mAP@50-95</th><th>Box loss</th><th>Class loss</th><th>DFL loss</th></tr></thead>
+                                <tbody>
+                                    <tr v-for="row in modelInfo.metrics_history" :key="row.epoch">
+                                        <td>{{ row.epoch }}</td>
+                                        <td>{{ metricPercent(row.precision) }}</td>
+                                        <td>{{ metricPercent(row.recall) }}</td>
+                                        <td>{{ metricPercent(row.map50) }}</td>
+                                        <td>{{ metricPercent(row.map50_95) }}</td>
+                                        <td>{{ decimalValue(row.train_box_loss) }}</td>
+                                        <td>{{ decimalValue(row.train_cls_loss) }}</td>
+                                        <td>{{ decimalValue(row.train_dfl_loss) }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="module" v-show="activeModule === 'inference'">
+            <div class="two-grid inference-grid">
+                <div class="control-card">
+                    <div class="card-title"><span>MODEL PLAYGROUND</span><h2>模型推理测试</h2><p>使用最新权重对单张图片推理，并查看每个目标框的原始坐标。</p></div>
+                    <div class="model-summary">
+                        <div><span>模型</span><b>{{ modelInfo.weights?.archived || "未找到权重" }}</b></div>
+                        <div><span>mAP@50</span><b>{{ metricPercent(modelInfo.metrics.map50) }}</b></div>
+                        <div><span>设备</span><b>CPU</b></div>
+                    </div>
+                    <div class="drop-zone" @click="$refs.inferenceInput.click()" @dragover.prevent @drop.prevent="onInferenceDrop">
+                        <input ref="inferenceInput" type="file" accept="image/*" hidden @change="onInferenceSelect">
+                        <img v-if="inferencePreview" :src="inferencePreview" alt="推理测试图片">
+                        <div v-else class="drop-empty"><span>＋</span><b>选择测试图片</b><small>JPG / PNG / WEBP</small></div>
+                    </div>
+                    <label class="range-label"><span>置信度阈值</span><b>{{ Math.round(inferenceConfidence*100) }}%</b></label>
+                    <input v-model.number="inferenceConfidence" type="range" min="0.05" max="0.9" step="0.05" class="range">
+                    <div class="check-group">
+                        <span class="check-group-title">标注显示</span>
+                        <label class="check-item"><input type="checkbox" v-model="displayOptions.showLabel"><span>类别标签</span></label>
+                        <label class="check-item" :class="{ muted: !displayOptions.showLabel }"><input type="checkbox" v-model="displayOptions.showConfidence" :disabled="!displayOptions.showLabel"><span>置信度</span></label>
+                        <label class="check-item"><input type="checkbox" v-model="displayOptions.showLegend"><span>类别图例</span></label>
+                    </div>
+                    <div class="control-actions">
+                        <button class="primary" @click="runInference" :disabled="inferenceLoading || !inferenceFile">{{ inferenceLoading ? "推理中..." : "运行模型推理" }}</button>
+                        <button class="secondary" v-if="inferencePreview" @click="clearInference">清除</button>
+                    </div>
+                    <p class="error-text" v-if="inferenceError">{{ inferenceError }}</p>
+                </div>
+                <div class="result-card">
+                    <template v-if="inferenceResult">
+                        <div class="result-head"><div><span>推理输出</span><h3>{{ inferenceResult.object_count }} 个目标</h3></div><small>{{ inferenceResult.inference_ms }} ms</small></div>
+                        <img class="result-image" :src="inferenceResult.annotated_img_url" alt="模型推理标注结果">
+                        <div class="detection-table">
+                            <table><thead><tr><th>#</th><th>类别</th><th>置信度</th><th>边界框 x1,y1,x2,y2</th></tr></thead>
+                            <tbody><tr v-for="(item,index) in inferenceResult.detections" :key="index"><td>{{ index+1 }}</td><td>{{ item.label }}</td><td>{{ confidencePercent(item.confidence) }}</td><td class="mono">{{ item.bbox.join(", ") }}</td></tr></tbody></table>
+                        </div>
+                    </template>
+                    <div v-else class="module-empty"><div class="target-icon"></div><b>等待模型推理</b><span>上传图片后将显示标注图和目标坐标。</span></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="module" v-show="activeModule === 'dashboard'">
+            <div class="kpi-grid four">
+                <article class="kpi"><span>检测记录</span><b>{{ dashboard.defects?.total_records || 0 }}</b><small>台账记录</small></article>
+                <article class="kpi"><span>图片识别</span><b>{{ dashboard.recognition?.total || 0 }}</b><small>历史识别次数</small></article>
+                <article class="kpi"><span>识别目标</span><b>{{ dashboard.recognition?.objects || 0 }}</b><small>累计目标数</small></article>
+                <article class="kpi"><span>视频任务</span><b>{{ dashboard.recognition?.videos || 0 }}</b><small>视频识别记录</small></article>
+            </div>
+            <div class="two-grid">
+                <article class="chart-card">
+                    <div class="chart-title"><div><h3>检测记录类型分布</h3><p>帮助定位最常见的缺陷记录类型。</p></div></div>
+                    <div class="bar-chart" v-if="dashboard.defects?.type_counts?.length">
+                        <div v-for="item in dashboard.defects.type_counts" :key="item.type_name" class="bar-row"><span>{{ item.type_name }}</span><i><em :style="{ width: barPercent(item.count, dashboard.defects.type_counts, 'count') }"></em></i><b>{{ item.count }}</b></div>
+                    </div>
+                    <div v-else class="module-empty small-empty"><b>暂无检测记录</b><span>可用智能助手的视频分析归档，或在 Django 后台录入。</span></div>
+                </article>
+                <article class="chart-card">
+                    <div class="chart-title"><div><h3>识别类别分布</h3><p>统计历史识别结果中的目标类别。</p></div></div>
+                    <div class="bar-chart" v-if="recognitionClassRows.length">
+                        <div v-for="item in recognitionClassRows" :key="item.label" class="bar-row"><span>{{ item.label }}</span><i><em :style="{ width: barPercent(item.count, recognitionClassRows) }"></em></i><b>{{ item.count }}</b></div>
+                    </div>
+                    <div v-else class="module-empty small-empty"><b>暂无识别数据</b><span>在“图片与视频识别”中上传图片。</span></div>
+                </article>
+            </div>
+            <div class="section-card">
+                <div class="section-head"><div><h2>最近活动</h2><p>最近的检测台账与图片识别结果。</p></div></div>
+                <div class="activity-grid">
+                    <div>
+                        <h3>检测记录</h3>
+                        <div v-for="item in dashboard.recent_defects" :key="item.id" class="activity-row"><img :src="item.original_img_url" alt=""><div><b>{{ item.defect_type_name }}</b><span>{{ item.detect_person }} · {{ item.device_id }}</span></div><small>{{ formatDate(item.detect_time,false) }}</small></div>
+                    </div>
+                    <div>
+                        <h3>图片识别</h3>
+                        <div v-for="item in dashboard.recognition?.recent || []" :key="item.id" class="activity-row"><img :src="item.annotated_img_url" alt=""><div><b>{{ item.object_count }} 个目标</b><span>{{ Object.keys(item.class_counts || {}).join(" · ") }}</span></div><small>{{ formatDate(item.created_at,true) }}</small></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="module" v-show="activeModule === 'media'">
+            <div class="tab-switch"><button :class="{active:mediaTab==='image'}" @click="mediaTab='image'">图片识别</button><button :class="{active:mediaTab==='video'}" @click="mediaTab='video'">视频识别</button></div>
+            <div class="two-grid media-grid" v-show="mediaTab==='image'">
+                <div class="control-card">
+                    <div class="card-title"><span>IMAGE RECOGNITION</span><h2>上传生活垃圾图片</h2><p>识别目标、类别和置信度，并保存识别历史。</p></div>
+                    <div class="drop-zone" @click="$refs.mediaImageInput.click()" @dragover.prevent @drop.prevent="onMediaImageDrop">
+                        <input ref="mediaImageInput" type="file" accept="image/*" hidden @change="onMediaImageSelect">
+                        <img v-if="mediaImagePreview" :src="mediaImagePreview" alt="物品识别图片">
+                        <div v-else class="drop-empty"><span>＋</span><b>拖入生活垃圾图片</b><small>系统调用最新训练模型</small></div>
+                    </div>
+                    <label class="range-label"><span>置信度阈值</span><b>{{ Math.round(mediaConfidence*100) }}%</b></label>
+                    <input v-model.number="mediaConfidence" type="range" min="0.05" max="0.9" step="0.05" class="range">
+                    <div class="check-group">
+                        <span class="check-group-title">标注显示</span>
+                        <label class="check-item"><input type="checkbox" v-model="displayOptions.showLabel"><span>类别标签</span></label>
+                        <label class="check-item" :class="{ muted: !displayOptions.showLabel }"><input type="checkbox" v-model="displayOptions.showConfidence" :disabled="!displayOptions.showLabel"><span>置信度</span></label>
+                        <label class="check-item"><input type="checkbox" v-model="displayOptions.showLegend"><span>类别图例</span></label>
+                    </div>
+                    <div class="control-actions"><button class="primary" @click="runMediaRecognition" :disabled="mediaLoading || !mediaFile">{{ mediaLoading ? "识别中..." : "开始图片识别" }}</button><button class="secondary" v-if="mediaImagePreview" @click="clearMedia">清除</button></div>
+                    <p class="error-text" v-if="mediaError">{{ mediaError }}</p>
+                </div>
+                <div class="result-card">
+                    <template v-if="mediaResult"><div class="result-head"><div><span>图片识别结果</span><h3>{{ mediaResult.object_count }} 个目标</h3></div><small>{{ mediaResult.inference_ms }} ms</small></div><img class="result-image" :src="mediaResult.annotated_img_url" alt="图片识别标注图"><div class="class-chips"><span v-for="(count,label) in mediaResult.class_counts" :key="label">{{ label }} <b>{{ count }}</b></span></div></template>
+                    <div v-else class="module-empty"><div class="target-icon"></div><b>等待图片识别</b><span>结果会自动保存到识别历史。</span></div>
+                </div>
+            </div>
+            <div class="two-grid media-grid" v-show="mediaTab==='video'">
+                <div class="control-card">
+                    <div class="card-title"><span>VIDEO RECOGNITION</span><h2>上传检测视频</h2><p>纯本地 YOLO 识别，最多处理 300 帧采样画面；需要大模型解读时请使用“智能助手”。</p></div>
+                    <div class="drop-zone video-drop" @click="$refs.mediaVideoInput.click()" @dragover.prevent @drop.prevent="onMediaVideoDrop">
+                        <input ref="mediaVideoInput" type="file" accept="video/*" hidden @change="onMediaVideoSelect">
+                        <video v-if="mediaVideoPreview" :src="mediaVideoPreview" controls></video>
+                        <div v-else class="drop-empty"><span>▶</span><b>拖入 MP4 / AVI / MOV</b><small>视频最大 100 MB</small></div>
+                    </div>
+                    <div class="field-pair"><label class="range-label"><span>置信度</span><b>{{ Math.round(mediaConfidence*100) }}%</b></label><label class="field compact-field"><span>抽帧间隔</span><input v-model.number="videoFrameStride" type="number" min="1" max="10"></label></div>
+                    <input v-model.number="mediaConfidence" type="range" min="0.05" max="0.9" step="0.05" class="range">
+                    <div class="control-actions"><button class="primary" @click="runVideoRecognition" :disabled="videoLoading || !mediaVideoFile">{{ videoLoading ? "视频处理中..." : "开始视频识别" }}</button><button class="secondary" v-if="mediaVideoPreview" @click="clearVideo">清除</button></div>
+                    <p class="error-text" v-if="videoError">{{ videoError }}</p>
+                </div>
+                <div class="result-card">
+                    <template v-if="videoResult"><div class="result-head"><div><span>视频识别结果</span><h3>{{ videoResult.processed_frames }} 帧 · {{ videoResult.object_count }} 个目标</h3></div><small>{{ videoResult.inference_ms }} ms</small></div><img v-if="videoResult.annotated_preview_url" class="result-video result-animation" :src="videoResult.annotated_preview_url" alt="视频标注动画预览"><video v-else class="result-video" :src="videoResult.annotated_video_url" controls></video><p class="video-summary">原视频 {{ videoResult.original_frames }} 帧，{{ videoResult.truncated ? "已达到 300 帧上限" : "视频已完整处理" }}。<a :href="videoResult.annotated_video_url" target="_blank">打开完整标注视频</a></p></template>
+                    <div v-else class="module-empty"><div class="video-icon"></div><b>等待视频识别</b><span>处理完成后可在线播放标注视频。</span></div>
+                </div>
+            </div>
+            <div class="section-card">
+                <div class="section-head"><div><h2>识别历史</h2><p>图片与视频识别结果会保留在本地数据库中。</p></div></div>
+                <h3 class="history-title">图片记录</h3>
+                <div class="history-list"><article v-for="item in recognitionHistory" :key="item.id" class="history-card" @click="selectMediaRecord(item)"><img :src="item.annotated_img_url" alt=""><div><b>#{{ item.id }} · {{ item.object_count }} 目标</b><small>{{ formatDate(item.created_at,true) }}</small></div><button @click.stop="deleteRecognition(item)">×</button></article><span v-if="!recognitionHistory.length" class="empty-line">暂无图片识别记录</span></div>
+                <h3 class="history-title">视频记录</h3>
+                <div class="history-list"><article v-for="item in videoHistory" :key="item.id" class="history-card video-history" @click="selectVideoRecord(item)"><img v-if="item.annotated_preview_url" :src="item.annotated_preview_url" alt="视频标注预览"><video v-else :src="item.annotated_video_url" preload="metadata"></video><div><b>#{{ item.id }} · {{ item.processed_frames }} 帧</b><small>{{ item.object_count }} 个目标 · {{ formatDate(item.created_at,true) }}</small></div><button @click.stop="deleteVideo(item)">×</button></article><span v-if="!videoHistory.length" class="empty-line">暂无视频识别记录</span></div>
+            </div>
+        </section>
+
+        <section class="module" v-show="activeModule === 'assistant'">
+            <div class="tab-switch">
+                <button :class="{active: assistantTab==='chat'}" @click="assistantTab='chat'">对话助手</button>
+                <button :class="{active: assistantTab==='video'}" @click="assistantTab='video'">视频智能分析 · LLM 解读</button>
+            </div>
+
+            <div class="section-card assistant-chat-card" v-show="assistantTab==='chat'">
+                <div class="section-head">
+                    <div><h2>智能助手</h2><p>{{ llmStatus.label }} · 回答基于台账实时快照</p></div>
+                    <button class="secondary small" v-if="chatMessages.length" @click="clearChat">清空对话</button>
+                </div>
+                <div ref="assistantScroll" class="assistant-messages">
+                    <div v-if="!chatMessages.length" class="assistant-welcome">
+                        <p>我可以基于当前台账、模型指标和历史视频分析回答你的问题。</p>
+                        <ul>
+                            <li>台账里有哪些缺陷类型、各多少条记录？</li>
+                            <li>当前模型的 mAP / Precision / Recall 如何？</li>
+                            <li>最近一次视频分析得出了什么结论？</li>
+                        </ul>
+                    </div>
+                    <div v-for="(message, index) in chatMessages" :key="index" class="assistant-msg" :class="message.role">
+                        <div class="assistant-avatar">{{ showAvatar(message) }}</div>
+                        <div class="assistant-bubble">
+                            <div v-if="message.role === 'assistant'" class="markdown" v-html="renderMarkdown(message.content)"></div>
+                            <p v-else class="assistant-plain">{{ message.content }}</p>
+                            <span class="assistant-time">{{ message.time }}</span>
+                        </div>
+                    </div>
+                    <div class="assistant-msg assistant" v-if="chatSending">
+                        <div class="assistant-avatar">AI</div>
+                        <div class="assistant-bubble typing"><i></i><i></i><i></i></div>
+                    </div>
+                </div>
+                <div class="assistant-chips">
+                    <button v-for="chip in chatChips" :key="chip" type="button" :disabled="chatSending" @click="sendChat(chip)">{{ chip }}</button>
+                </div>
+                <form class="assistant-input" @submit.prevent="sendChat()">
+                    <textarea v-model="chatInput" rows="2" placeholder="输入问题，Enter 发送，Shift+Enter 换行" :disabled="chatSending" @keydown="onChatKeydown"></textarea>
+                    <button class="primary" type="submit" :disabled="chatSending || !chatInput.trim()">发送</button>
+                </form>
+                <p class="assistant-note">{{ llmNote }}</p>
+            </div>
+
+            <div v-show="assistantTab==='video'" class="video-card">
+                <div class="model-card-head">
+                    <div>
+                        <p class="eyebrow">LOCAL YOLO / LLM VIDEO INSIGHT</p>
+                        <h2>视频智能分析</h2>
+                        <p>上传视频 → 本地 YOLO 逐帧推理 → 大模型解读检测统计，结果可一键归档到检测台账。</p>
+                    </div>
+                    <span class="model-status video-status" :class="videoBadgeClass">{{ videoBadgeLabel }}</span>
+                </div>
+
+                <div class="video-grid">
+                    <div class="video-form">
+                        <label class="field file-field">
+                            <span>视频文件 *</span>
+                            <input type="file" :accept="videoAcceptAttr" :disabled="videoBusy" @change="onVideoChange">
+                            <small>支持 {{ videoAcceptText }}，单文件上限 {{ videoLimits.max_upload_mb || 200 }} MB；视频仅在本机推理。</small>
+                        </label>
+
+                        <div class="video-config">
+                            <label class="field">
+                                <span>置信度阈值 <b class="field-value">{{ Math.round(videoForm.conf * 100) }}%</b></span>
+                                <input v-model.number="videoForm.conf" type="range" min="0.05" max="0.9" step="0.05" :disabled="videoBusy">
+                            </label>
+                            <label class="field">
+                                <span>抽样帧数</span>
+                                <input v-model.number="videoForm.maxFrames" type="number" min="4" max="60" :disabled="videoBusy">
+                            </label>
+                            <label class="field">
+                                <span>检测人员（归档用）</span>
+                                <input v-model.trim="videoForm.person" maxlength="50" placeholder="例如：张工" :disabled="videoBusy">
+                            </label>
+                            <label class="field">
+                                <span>设备编号（归档用）</span>
+                                <input v-model.trim="videoForm.device" maxlength="50" placeholder="例如：CAM-A01" :disabled="videoBusy">
+                            </label>
+                        </div>
+
+                        <video v-if="videoLocalUrl" class="video-preview" :src="videoLocalUrl" controls preload="metadata"></video>
+
+                        <div class="video-actions">
+                            <button class="primary" type="button" :disabled="!videoFile || videoBusy" @click="startVideoAnalysis">
+                                <span class="loader small" v-if="videoBusy"></span>
+                                {{ videoBusy ? "分析中..." : "开始分析" }}
+                            </button>
+                            <button class="secondary" type="button" :disabled="videoBusy" @click="resetVideoPanel">重置</button>
+                        </div>
+
+                        <p class="video-file-hint" v-if="videoFile">已选择 {{ videoFileName }}（{{ formatSize(videoFile.size) }}）</p>
+
+                        <div class="video-progress" v-if="videoUploading || (videoJob && (videoJob.status === 'pending' || videoJob.status === 'running'))">
+                            <div class="video-progress-head">
+                                <span>{{ videoUploading ? "上传视频" : (videoJob.stage || "准备中") }}</span>
+                                <b>{{ videoUploading ? videoUploadPercent : (videoJob.progress || 0) }}%</b>
+                            </div>
+                            <div class="video-progress-track">
+                                <i :style="{ width: (videoUploading ? videoUploadPercent : (videoJob.progress || 0)) + '%' }"></i>
+                            </div>
+                            <p>{{ videoUploading ? "正在上传到本机 Django 服务..." : (videoJob.message || "等待推理进程...") }}</p>
+                        </div>
+
+                        <div class="video-runtime">
+                            <div>
+                                <span>推理环境</span>
+                                <b :class="{ warn: videoRuntime.python.available === false }" :title="videoRuntime.python.python || videoRuntime.python.detail">{{ runtimeLabel }}</b>
+                            </div>
+                            <div>
+                                <span>本地权重</span>
+                                <b>{{ videoRuntime.model && videoRuntime.model.path ? videoRuntime.model.path.split(/[\\/]/).pop() : "—" }}</b>
+                            </div>
+                            <button class="link-button" type="button" :disabled="probingRuntime" @click="probeRuntime">{{ probingRuntime ? "检测中..." : "重新检测环境" }}</button>
+                        </div>
+                    </div>
+
+                    <div class="video-result">
+                        <div v-if="!videoJob" class="video-placeholder">
+                            <div class="empty-illustration">▶</div>
+                            <h3>还没有分析结果</h3>
+                            <p>选择一段垃圾/质检现场视频后点击「开始分析」。YOLO 在本机运行，只有结构化统计会发给大模型。</p>
+                        </div>
+                        <template v-else>
+                            <div class="video-meta-grid">
+                                <div><span>视频时长</span><b>{{ videoSummary.duration_seconds != null ? formatSeconds(videoSummary.duration_seconds) : "—" }}</b></div>
+                                <div><span>分辨率</span><b>{{ (videoJob.result.video.width || "—") + " × " + (videoJob.result.video.height || "—") }}</b></div>
+                                <div><span>帧率</span><b>{{ videoJob.result.video.fps || "—" }} fps</b></div>
+                                <div><span>抽样帧</span><b>{{ videoSummary.frames_analyzed || 0 }} / {{ videoSummary.total_frames || videoJob.result.video.total_frames || "—" }}</b></div>
+                                <div><span>检出目标</span><b>{{ videoSummary.total_detections || 0 }} 个</b></div>
+                                <div><span>模型来源</span><b>{{ videoModelSource }}</b></div>
+                            </div>
+
+                            <div v-if="videoJob.status === 'failed'" class="video-fail">
+                                <strong>分析失败</strong>
+                                <pre>{{ videoJob.error }}</pre>
+                            </div>
+                            <template v-else>
+                                <div class="video-classes" v-if="videoClasses.length">
+                                    <div class="model-block-title"><h3>类别统计（本地 YOLO）</h3><span>按检出框数排序</span></div>
+                                    <div class="video-class-row" v-for="item in videoClasses" :key="item.name">
+                                        <span class="video-class-name">{{ item.name }}</span>
+                                        <span class="video-class-track"><i :style="{ width: Math.max(6, Math.round((item.detections / videoClassMax) * 100)) + '%' }"></i></span>
+                                        <b>{{ item.detections }} 框</b>
+                                        <em>{{ percentText(item.avg_conf) }}</em>
+                                        <small>{{ item.frames }} 帧命中</small>
+                                    </div>
+                                </div>
+                                <p class="video-empty-result" v-else-if="videoJob.status === 'completed'">本次抽样没有检出任何目标。可尝试降低置信度阈值或更换为垃圾类别的自训练权重。</p>
+
+                                <div class="keyframe-grid" v-if="videoKeyframes.length">
+                                    <figure v-for="frame in videoKeyframes" :key="frame.url">
+                                        <img :src="frame.url" :alt="'关键帧 ' + frame.time + ' 秒'" loading="lazy">
+                                        <figcaption>{{ formatSeconds(frame.time) }} · {{ frame.count }} 个目标 · {{ frame.top_class }}</figcaption>
+                                    </figure>
+                                </div>
+
+                                <div class="explanation" v-if="videoJob.explanation">
+                                    <div class="explanation-head"><h3>大模型解读</h3><span class="engine-badge">{{ videoJob.engine || "本地规则解释" }}</span></div>
+                                    <div class="markdown" v-html="renderMarkdown(videoJob.explanation)"></div>
+                                </div>
+
+                                <div class="video-result-actions" v-if="videoJob.status === 'completed'">
+                                    <button class="primary" type="button" :disabled="!!videoJob.record_id || archiving" @click="archiveVideoJob">
+                                        {{ videoJob.record_id ? "已归档为记录 #" + String(videoJob.record_id).padStart(4, "0") : (archiving ? "正在归档..." : "归档到检测台账") }}
+                                    </button>
+                                </div>
+                            </template>
+                        </template>
+                    </div>
+                </div>
+
+                <div class="video-history" v-if="videoJobs.length">
+                    <div class="model-block-title"><h3>最近分析</h3><span>{{ videoJobs.length }} 条</span></div>
+                    <div class="video-history-list">
+                        <button v-for="item in videoJobs" :key="item.id" class="video-history-item" :class="{ active: videoJob && videoJob.id === item.id }" type="button" @click="openVideoJob(item)">
+                            <b>#{{ item.id }} {{ item.original_name || "视频" }}</b>
+                            <span>{{ item.status_label }} · {{ item.created_at }} · {{ formatSize(item.size_bytes) }}</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <transition name="toast"><div v-if="toast.message" class="toast" :class="toast.type">{{ toast.message }}</div></transition>
+</div>
+<noscript>ODPlatform 需要启用 JavaScript。</noscript>
+<script src="/assets/vendor/vue.global.prod.js"></script>
+<script src="/assets/vendor/axios.min.js"></script>
+<script src="/assets/data-engineering.js"></script>
+<script src="/assets/assistant.js"></script>
+<script src="/assets/app.js"></script>
+</body>
+</html>

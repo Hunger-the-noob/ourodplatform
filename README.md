@@ -6,12 +6,13 @@
 
 - `apps/platform/` — 核心引擎与 `od-platform` Python 包
 - `apps/desktop/` — PySide6 桌面推理演示
-- `apps/web-backend/` — Django + DRF + Vue 3 Web 控制台
+- `apps/web-backend/` — Django + DRF + Vue 3 Web 控制台（数据理解 / 训练 / 评估 / 图片与视频识别 + 智能助手 / 视频 LLM 解读）
 - `data/` — 原始数据与处理产物
 - `models/` — 预训练权重与训练产物
 - `runs/` — 数据、训练与推理运行现场
 - `tests/` — 跨端 E2E 测试占位
 - `docs/architecture/` — 架构决策记录
+- `docs/assistant-llm-video.md` — 智能助手 + 视频 YOLO → 大模型解读说明
 
 ## 安装
 
@@ -28,6 +29,13 @@ odp-init
 python -m pip install -e "./apps/platform[dev]"
 ```
 
+需要运行 Gradio 演示界面时，再安装演示依赖：
+
+```powershell
+python -m pip install -e "./apps/platform[demo]"
+python .\apps\demo\app.py
+```
+
 ## 常用命令
 
 ```powershell
@@ -37,6 +45,7 @@ odp-train --data <数据集名> --epochs 10
 odp-infer --source "D:\images\test.jpg" --model "models\pretrained\yolov8n.pt" --no-show
 powershell -ExecutionPolicy Bypass -File .\scripts\run_desktop.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\run_web.ps1
+python .\scripts\make_demo_video.py --output .\runs\demo\demo.mp4
 ```
 
 Web 工作台还包含生活垃圾图片识别模块：上传图片后调用最新训练权重生成
@@ -46,3 +55,6 @@ Web 工作台还包含生活垃圾图片识别模块：上传图片后调用最�
 
 数据工程开发、进度条、16 项质检、历史报告对比、pytest 与 pre-commit 用法见
 [D3/D4 数据工程协作说明](docs/data-engineering.md)。
+
+本次数据、算法、Web 和智能助手新增代码的带注释阅读副本位于
+[`新增代码/`](新增代码/README.md)；副本只用于阅读，实际运行仍使用各业务目录中的源码。

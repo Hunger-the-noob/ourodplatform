@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
+from django.urls import resolve
 from PIL import Image
 from rest_framework.test import APIClient
 
@@ -20,6 +21,23 @@ from .data_worker import write_state
 
 
 class WebDataTests(SimpleTestCase):
+    def test_original_data_routes_keep_their_original_module(self):
+        for url in ("/api/data/", "/api/data/validate/", "/api/data/sample/train/example.jpg"):
+            with self.subTest(url=url):
+                self.assertEqual(resolve(url).func.__module__, "defect.api_views")
+
+    def test_original_yaml_reader_and_constants_remain_available(self):
+        from . import api_views, data_understanding
+
+        self.assertTrue(callable(data_understanding._read_dataset_yaml))
+        self.assertEqual(api_views.DATASET_YAML, data_understanding.DATASET_YAML)
+        self.assertTrue(hasattr(data_understanding, "PROJECT_ROOT"))
+        with patch.object(data_understanding, "DATASET_YAML", paths.dataset_yaml_path("web_demo")):
+            document = data_understanding._read_dataset_yaml()
+            overview = data_understanding.get_dataset_understanding()
+            self.assertEqual(document["nc"], 1)
+            self.assertEqual(overview["total_images"], 12)
+
     def test_progress_write_retries_windows_sharing_violation(self):
         directory = self.root / "state-test"
         directory.mkdir()
