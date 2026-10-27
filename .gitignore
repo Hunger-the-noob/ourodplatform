@@ -95,3 +95,8 @@ temp/
 *.pkl
 *.h5
 *.npz
+
+# 本地密钥与运行配置：只提交模板，不提交真实 Key
+.env
+.env.*
+!.env.example

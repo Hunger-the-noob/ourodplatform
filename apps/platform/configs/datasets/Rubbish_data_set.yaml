@@ -20,9 +20,9 @@ odp_meta:
   source_format: yolo
   task: detect
   tool_version: odp-transform/0.4
-  created_at: '2026-10-26T15:05:57'
+  created_at: '2026-10-27T15:43:11'
   contract_fingerprint: 8ae24bde71c826f31728a3c886391b10f90ba5e08da20300954af2649e8ff284
-  manifest_path: runs/data_pipeline/20261026-150557/manifest.json
+  manifest_path: runs/data_pipeline/20261027-154311/manifest.json
   split:
     strategy: stratified_multilabel
     seed: 42

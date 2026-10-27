@@ -23,3 +23,5 @@
 - `tests.py`：统计、接口、上传、归档与运行环境测试。
 
 大模型配置写在 `apps/web-backend/.env`，不要把真实 API Key 提交到 GitHub。
+本机已验证 `DeepSeek · deepseek-flash` 的 Chat Completions 请求和
+`/api/assistant/chat/` 网页接口均返回成功；空白模板见 `DeepSeek配置示例.env`。
