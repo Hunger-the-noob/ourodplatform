@@ -24,6 +24,7 @@ urlpatterns = [
     path("", frontend_index, name="frontend_home"),
     path("admin/", admin.site.urls),
     path("defect/", include("defect.urls")),
+    path("api/assistant/", include("assistant.urls")),
     path("api/stats/", dashboard_stats, name="dashboard-stats"),
     path("api/model/", model_overview, name="model-overview"),
     path("api/model/training-curve/", training_curve, name="training-curve"),

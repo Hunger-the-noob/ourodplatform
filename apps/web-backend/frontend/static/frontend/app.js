@@ -1,4 +1,4 @@
-const { computed, createApp, onMounted, reactive, ref } = Vue;
+const { computed, createApp, onMounted, onUnmounted, reactive, ref } = Vue;
 
 const API_BASE = "/api";
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -364,9 +364,21 @@ createApp({
             }
         };
 
-        onMounted(loadAll);
+        // 智能助手 + 视频分析：状态与方法由 assistant.js 提供，这里只负责组装
+        const assistant = window.AssistantModule.create({
+            notify: showToast,
+            getErrorMessage,
+            onArchived: loadAll,
+        });
+
+        onMounted(() => {
+            loadAll();
+            assistant.init();
+        });
+        onUnmounted(() => assistant.dispose());
 
         return {
+            ...assistant,
             records,
             typeList,
             stats,

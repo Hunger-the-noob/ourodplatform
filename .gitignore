@@ -73,6 +73,9 @@ runs/*
 apps/platform/logging/
 *.log
 
+# 本地密钥配置(大模型 API Key 等,只保留 .env.example)
+apps/web-backend/.env
+
 # 临时文件
 tmp/
 temp/

@@ -2,3 +2,10 @@ Django==5.2.18
 djangorestframework==3.18.3
 django-cors-headers==4.9.0
 Pillow>=10.0.0
+PyYAML>=6.0
+# 智能助手调用大模型用（HTTP 客户端，不绑定任何 SDK）
+requests>=2.31.0
+
+# 注意：视频分析里的 ultralytics / opencv-python / torch 不装在这个 Web 环境，
+# 而是装在「YOLO 推理环境」里，由 assistant 自动探测或用 ODP_YOLO_PYTHON 指定。
+# 安装命令示例：python -m pip install ultralytics opencv-python

@@ -22,13 +22,41 @@
         </a>
 
         <nav class="side-nav" aria-label="主导航">
-            <button class="nav-item active" type="button">
+            <button
+                class="nav-item"
+                :class="{ active: activeNav === 'ledger' }"
+                type="button"
+                @click="scrollToLedger"
+            >
                 <span class="nav-icon">▦</span>
                 <span>检测台账</span>
             </button>
-            <button class="nav-item" type="button" @click="scrollToModel">
+            <button
+                class="nav-item"
+                :class="{ active: activeNav === 'video' }"
+                type="button"
+                @click="scrollToVideo"
+            >
+                <span class="nav-icon">▶</span>
+                <span>视频智能分析</span>
+            </button>
+            <button
+                class="nav-item"
+                :class="{ active: activeNav === 'model' }"
+                type="button"
+                @click="activeNav = 'model'; scrollToModel()"
+            >
                 <span class="nav-icon">◎</span>
                 <span>模型训练</span>
+            </button>
+            <button
+                class="nav-item nav-item-ai"
+                :class="{ active: assistantOpen }"
+                type="button"
+                @click="toggleAssistant"
+            >
+                <span class="nav-icon">✦</span>
+                <span>智能助手</span>
             </button>
             <a class="nav-item" href="/defect/list/">
                 <span class="nav-icon">⌁</span>
@@ -65,7 +93,7 @@
         </div>
     </aside>
 
-    <main class="main-content">
+    <main class="main-content" :class="{ 'with-assistant': assistantOpen }">
         <header class="page-header">
             <div>
                 <p class="eyebrow">INDUSTRIAL VISION / QUALITY LEDGER</p>
@@ -120,6 +148,203 @@
                 <strong>{{ confidencePercent(stats.average_confidence) }}</strong>
                 <p>全部记录平均值</p>
             </article>
+        </section>
+
+        <section id="video-panel" class="video-card">
+            <div class="model-card-head">
+                <div>
+                    <p class="eyebrow">LOCAL YOLO / LLM VIDEO INSIGHT</p>
+                    <h2>视频智能分析</h2>
+                    <p>上传视频 → 本地 YOLO 逐帧推理 → 大模型解读检测统计，结果可一键归档到检测台账。</p>
+                </div>
+                <span class="model-status video-status" :class="videoBadgeClass">{{ videoBadgeLabel }}</span>
+            </div>
+
+            <div class="video-grid">
+                <div class="video-form">
+                    <label class="field file-field">
+                        <span>视频文件 *</span>
+                        <input type="file" :accept="videoAcceptAttr" :disabled="videoBusy" @change="onVideoChange">
+                        <small>支持 {{ videoAcceptText }}，单文件上限 {{ videoLimits.max_upload_mb || 200 }} MB；视频仅在本机推理。</small>
+                    </label>
+
+                    <div class="video-config">
+                        <label class="field">
+                            <span>置信度阈值 <b class="field-value">{{ Math.round(videoForm.conf * 100) }}%</b></span>
+                            <input
+                                v-model.number="videoForm.conf"
+                                type="range"
+                                min="0.05"
+                                max="0.9"
+                                step="0.05"
+                                :disabled="videoBusy"
+                            >
+                        </label>
+                        <label class="field">
+                            <span>抽样帧数</span>
+                            <input
+                                v-model.number="videoForm.maxFrames"
+                                type="number"
+                                min="4"
+                                max="60"
+                                :disabled="videoBusy"
+                            >
+                        </label>
+                        <label class="field">
+                            <span>检测人员（归档用）</span>
+                            <input v-model.trim="videoForm.person" maxlength="50" placeholder="例如：张工" :disabled="videoBusy">
+                        </label>
+                        <label class="field">
+                            <span>设备编号（归档用）</span>
+                            <input v-model.trim="videoForm.device" maxlength="50" placeholder="例如：CAM-A01" :disabled="videoBusy">
+                        </label>
+                    </div>
+
+                    <video v-if="videoLocalUrl" class="video-preview" :src="videoLocalUrl" controls preload="metadata"></video>
+
+                    <div class="video-actions">
+                        <button
+                            class="primary-button"
+                            type="button"
+                            :disabled="!videoFile || videoBusy"
+                            @click="startVideoAnalysis"
+                        >
+                            <span class="loader small" v-if="videoBusy"></span>
+                            {{ videoBusy ? "分析中..." : "开始分析" }}
+                        </button>
+                        <button class="secondary-button" type="button" :disabled="videoBusy" @click="resetVideoPanel">
+                            重置
+                        </button>
+                    </div>
+
+                    <p class="video-file-hint" v-if="videoFile">
+                        已选择 {{ videoFileName }}（{{ formatSize(videoFile.size) }}）
+                    </p>
+
+                    <div class="video-progress" v-if="videoUploading || (videoJob && (videoJob.status === 'pending' || videoJob.status === 'running'))">
+                        <div class="video-progress-head">
+                            <span>{{ videoUploading ? "上传视频" : (videoJob.stage || "准备中") }}</span>
+                            <b>{{ videoUploading ? videoUploadPercent : (videoJob.progress || 0) }}%</b>
+                        </div>
+                        <div class="video-progress-track">
+                            <i :style="{ width: (videoUploading ? videoUploadPercent : (videoJob.progress || 0)) + '%' }"></i>
+                        </div>
+                        <p>{{ videoUploading ? "正在上传到本机 Django 服务..." : (videoJob.message || "等待推理进程...") }}</p>
+                    </div>
+
+                    <div class="video-runtime">
+                        <div>
+                            <span>推理环境</span>
+                            <b :class="{ warn: videoRuntime.python.available === false }" :title="videoRuntime.python.python || videoRuntime.python.detail">{{ runtimeLabel }}</b>
+                        </div>
+                        <div>
+                            <span>本地权重</span>
+                            <b>{{ videoRuntime.model && videoRuntime.model.path ? videoRuntime.model.path.split(/[\\/]/).pop() : "—" }}</b>
+                        </div>
+                        <button class="link-button" type="button" :disabled="probingRuntime" @click="probeRuntime">
+                            {{ probingRuntime ? "检测中..." : "重新检测环境" }}
+                        </button>
+                    </div>
+                </div>
+
+                <div class="video-result">
+                    <div v-if="!videoJob" class="video-placeholder">
+                        <div class="empty-illustration">▶</div>
+                        <h3>还没有分析结果</h3>
+                        <p>选择一段垃圾/质检现场视频后点击「开始分析」。YOLO 在本机运行，只有结构化统计会发给大模型。</p>
+                    </div>
+
+                    <template v-else>
+                        <div class="video-meta-grid">
+                            <div><span>视频时长</span><b>{{ videoSummary.duration_seconds != null ? formatSeconds(videoSummary.duration_seconds) : "—" }}</b></div>
+                            <div><span>分辨率</span><b>{{ (videoJob.result.video.width || "—") + " × " + (videoJob.result.video.height || "—") }}</b></div>
+                            <div><span>帧率</span><b>{{ videoJob.result.video.fps || "—" }} fps</b></div>
+                            <div><span>抽样帧</span><b>{{ videoSummary.frames_analyzed || 0 }} / {{ videoSummary.total_frames || videoJob.result.video.total_frames || "—" }}</b></div>
+                            <div><span>检出目标</span><b>{{ videoSummary.total_detections || 0 }} 个</b></div>
+                            <div><span>模型来源</span><b>{{ videoModelSource }}</b></div>
+                        </div>
+
+                        <div v-if="videoJob.status === 'failed'" class="video-fail">
+                            <strong>分析失败</strong>
+                            <pre>{{ videoJob.error }}</pre>
+                        </div>
+
+                        <template v-else>
+                            <div class="video-classes" v-if="videoClasses.length">
+                                <div class="model-block-title">
+                                    <h3>类别统计（本地 YOLO）</h3>
+                                    <span>按检出框数排序</span>
+                                </div>
+                                <div class="video-class-row" v-for="item in videoClasses" :key="item.name">
+                                    <span class="video-class-name">{{ item.name }}</span>
+                                    <span class="video-class-track">
+                                        <i :style="{ width: Math.max(6, Math.round((item.detections / videoClassMax) * 100)) + '%' }"></i>
+                                    </span>
+                                    <b>{{ item.detections }} 框</b>
+                                    <em>{{ percentText(item.avg_conf) }}</em>
+                                    <small>{{ item.frames }} 帧命中</small>
+                                </div>
+                            </div>
+                            <p class="video-empty-result" v-else-if="videoJob.status === 'completed'">
+                                本次抽样没有检出任何目标。可尝试降低置信度阈值或更换为垃圾类别的自训练权重。
+                            </p>
+
+                            <div class="keyframe-grid" v-if="videoKeyframes.length">
+                                <figure v-for="frame in videoKeyframes" :key="frame.url">
+                                    <img :src="frame.url" :alt="'关键帧 ' + frame.time + ' 秒'" loading="lazy">
+                                    <figcaption>
+                                        {{ formatSeconds(frame.time) }} · {{ frame.count }} 个目标 · {{ frame.top_class }}
+                                    </figcaption>
+                                </figure>
+                            </div>
+
+                            <div class="explanation" v-if="videoJob.explanation">
+                                <div class="explanation-head">
+                                    <h3>大模型解读</h3>
+                                    <span class="engine-badge">{{ videoJob.engine || "本地规则解释" }}</span>
+                                </div>
+                                <div class="markdown" v-html="renderMarkdown(videoJob.explanation)"></div>
+                            </div>
+
+                            <div class="video-result-actions" v-if="videoJob.status === 'completed'">
+                                <button
+                                    class="primary-button"
+                                    type="button"
+                                    :disabled="!!videoJob.record_id || archiving"
+                                    @click="archiveVideoJob"
+                                >
+                                    {{
+                                        videoJob.record_id
+                                            ? "已归档为记录 #" + String(videoJob.record_id).padStart(4, "0")
+                                            : (archiving ? "正在归档..." : "归档到检测台账")
+                                    }}
+                                </button>
+                                <a class="secondary-button" href="/defect/list/" v-if="videoJob.record_id">查看台账</a>
+                            </div>
+                        </template>
+                    </template>
+                </div>
+            </div>
+
+            <div class="video-history" v-if="videoJobs.length">
+                <div class="model-block-title">
+                    <h3>最近分析</h3>
+                    <span>{{ videoJobs.length }} 条（含历史任务）</span>
+                </div>
+                <div class="video-history-list">
+                    <button
+                        v-for="item in videoJobs"
+                        :key="item.id"
+                        class="video-history-item"
+                        :class="{ active: videoJob && videoJob.id === item.id }"
+                        type="button"
+                        @click="openVideoJob(item)"
+                    >
+                        <b>#{{ item.id }} {{ item.original_name || "视频" }}</b>
+                        <span>{{ item.status_label }} · {{ item.created_at }} · {{ formatSize(item.size_bytes) }}</span>
+                    </button>
+                </div>
+            </div>
         </section>
 
         <section id="model-panel" class="model-card">
@@ -234,7 +459,7 @@
             </template>
         </section>
 
-        <section class="content-card">
+        <section id="records-panel" class="content-card">
             <div class="content-head">
                 <div>
                     <h2>检测记录</h2>
@@ -423,6 +648,90 @@
         </section>
     </div>
 
+    <div class="assistant-backdrop" v-if="assistantOpen" @click="toggleAssistant"></div>
+    <transition name="drawer">
+        <section v-if="assistantOpen" class="assistant-panel" role="dialog" aria-label="智能助手">
+            <header class="assistant-head">
+                <div>
+                    <span class="modal-kicker">AI ASSISTANT / {{ llmStatus.configured ? "LLM" : "LOCAL" }}</span>
+                    <h2>智能助手</h2>
+                    <p>{{ llmStatus.label }}</p>
+                </div>
+                <div class="assistant-head-actions">
+                    <button class="link-button" type="button" v-if="chatMessages.length" @click="clearChat">清空</button>
+                    <button class="close-button" type="button" aria-label="关闭" @click="toggleAssistant">×</button>
+                </div>
+            </header>
+
+            <div ref="assistantScroll" class="assistant-messages">
+                <div v-if="!chatMessages.length" class="assistant-welcome">
+                    <p>我可以基于当前台账、模型指标和历史视频分析回答你的问题。</p>
+                    <ul>
+                        <li>台账里有哪些缺陷类型、各多少条记录？</li>
+                        <li>当前模型的 mAP / Precision / Recall 如何？</li>
+                        <li>最近一次视频分析得出了什么结论？</li>
+                    </ul>
+                </div>
+                <div
+                    v-for="(message, index) in chatMessages"
+                    :key="index"
+                    class="assistant-msg"
+                    :class="message.role"
+                >
+                    <div class="assistant-avatar">{{ showAvatar(message) }}</div>
+                    <div class="assistant-bubble">
+                        <div
+                            v-if="message.role === 'assistant'"
+                            class="markdown"
+                            v-html="renderMarkdown(message.content)"
+                        ></div>
+                        <p v-else class="assistant-plain">{{ message.content }}</p>
+                        <span class="assistant-time">{{ message.time }}</span>
+                    </div>
+                </div>
+                <div class="assistant-msg assistant" v-if="chatSending">
+                    <div class="assistant-avatar">AI</div>
+                    <div class="assistant-bubble typing"><i></i><i></i><i></i></div>
+                </div>
+            </div>
+
+            <div class="assistant-chips">
+                <button
+                    v-for="chip in chatChips"
+                    :key="chip"
+                    type="button"
+                    :disabled="chatSending"
+                    @click="sendChat(chip)"
+                >
+                    {{ chip }}
+                </button>
+            </div>
+
+            <form class="assistant-input" @submit.prevent="sendChat()">
+                <textarea
+                    v-model="chatInput"
+                    rows="2"
+                    placeholder="输入问题，Enter 发送，Shift+Enter 换行"
+                    :disabled="chatSending"
+                    @keydown="onChatKeydown"
+                ></textarea>
+                <button class="primary-button" type="submit" :disabled="chatSending || !chatInput.trim()">
+                    发送
+                </button>
+            </form>
+            <p class="assistant-note">{{ llmNote }}</p>
+        </section>
+    </transition>
+    <button
+        v-if="!assistantOpen"
+        class="assistant-fab"
+        type="button"
+        title="智能助手"
+        @click="toggleAssistant"
+    >
+        ✦
+    </button>
+
     <transition name="toast">
         <div v-if="toast.message" class="toast" :class="toast.type">
             <span>{{ toast.type === "error" ? "!" : "✓" }}</span>
@@ -434,6 +743,7 @@
 <noscript>此页面需要启用 JavaScript。</noscript>
 <script src="/assets/vendor/vue.global.prod.js"></script>
 <script src="/assets/vendor/axios.min.js"></script>
+<script src="/assets/assistant.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>
