@@ -1,0 +1,9 @@
+# 新增：数据工程与 Web 测试的轻量开发环境，不下载 torch/模型。
+-r apps/web-backend/requirements.txt
+pytest>=7.4
+pytest-cov>=4.1
+ruff==0.15.1
+pre-commit>=3.4
+colorlog>=6.7
+psutil>=5.9
+pydantic>=2.5,<3

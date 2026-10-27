@@ -91,15 +91,15 @@
             <div class="section-card">
                 <div class="section-head">
                     <div><h2>Rubbish_data_set 数据概览</h2><p>数据划分、类别分布和标注质量。</p></div>
-                    <button class="primary small" @click="validateDataset" :disabled="validatingData">
+                    <button class="primary small" @click="validateDataset" :disabled="dataRunning || !selectedDataset?.has_yaml">
                         {{ validatingData ? "正在验证..." : "重新验证数据" }}
                     </button>
                 </div>
                 <div class="kpi-grid four compact">
-                    <article class="kpi"><span>有效图片</span><b>{{ formatNumber(dataset.total_images) }}</b><small>全部有标签</small></article>
+                    <article class="kpi"><span>图片总数</span><b>{{ formatNumber(dataset.total_images) }}</b><small>质量结论见下方报告</small></article>
                     <article class="kpi"><span>目标框</span><b>{{ formatNumber(dataset.total_boxes) }}</b><small>检测实例总数</small></article>
                     <article class="kpi"><span>类别数</span><b>{{ dataset.class_count || 0 }}</b><small>{{ (dataset.classes || []).join(" · ") }}</small></article>
-                    <article class="kpi"><span>质检结论</span><b class="success-text">{{ dataset.validation?.severity || "—" }}</b><small>{{ dataset.strategy || "固定划分" }}</small></article>
+                    <article class="kpi"><span>质检结论</span><b :class="severityClass(dataset.validation?.severity)">{{ dataset.validation?.severity || "—" }}</b><small>{{ dataset.strategy || "固定划分" }}</small></article>
                 </div>
                 <div class="two-grid">
                     <article class="chart-card">
@@ -136,11 +136,51 @@
                 </div>
             </div>
             <div class="section-card pipeline-card">
-                <div class="section-head"><div><h2>数据流水线</h2><p>当前数据已经冻结，训练不会重新随机划分。</p></div></div>
+                <div class="section-head"><div><h2>数据工程 · D3 / D4</h2><p>选择数据集执行转换或质检，查看真实阶段进度和历史变化。</p></div></div>
+                <!-- 新增代码开始：D3 转换入口、D4 进度与历史质检报告。 -->
+                <fieldset class="data-form" :disabled="dataRunning">
+                    <label class="field"><span>数据集</span><select v-model="dataForm.dataset" @change="selectEngineeringDataset"><option v-for="item in engineering.datasets" :key="item.name" :value="item.name">{{ item.name }}{{ item.has_raw ? ' · 有原始数据' : '' }}</option></select></label>
+                    <label class="field"><span>原始标注格式</span><select v-model="dataForm.format"><option v-for="item in engineering.formats" :key="item" :value="item">{{ item }}</option></select></label>
+                    <label class="field"><span>任务</span><select v-model="dataForm.task"><option value="detect">目标检测</option><option value="segment" :disabled="dataForm.format === 'pascal_voc'">实例分割</option></select></label>
+                    <label class="field"><span>划分策略</span><select v-model="dataForm.split_strategy"><option v-for="item in engineering.strategies" :key="item" :value="item">{{ item }}</option></select></label>
+                    <label class="field"><span>类别顺序（逗号分隔）</span><input v-model="dataForm.classes" placeholder="YOLO 格式必填，如 head, 反光衣"></label>
+                    <label class="field"><span>训练集比例</span><input v-model.number="dataForm.train_rate" type="number" min="0.01" max="0.99" step="0.01"></label>
+                    <label class="field"><span>验证集比例</span><input v-model.number="dataForm.val_rate" type="number" min="0" max="0.99" step="0.01"></label>
+                    <label class="field"><span>随机种子</span><input v-model.number="dataForm.seed" type="number"></label>
+                </fieldset>
+                <div class="data-actions">
+                    <button class="primary small" @click="startDataJob('transform')" :disabled="dataRunning || trainingRunning || !selectedDataset?.has_raw">运行 D3 转换与划分</button>
+                    <button class="secondary small" @click="validateDataset" :disabled="dataRunning || !selectedDataset?.has_yaml">运行 D4 质量检查</button>
+                    <span v-if="!selectedDataset?.has_raw">此数据集尚无原始目录，添加数据后可执行 D3。</span>
+                </div>
+                <div v-if="dataJob.status !== 'idle'" class="data-progress" role="status" aria-live="polite">
+                    <b>{{ dataJob.dataset }} · {{ dataJob.operation === 'transform' ? 'D3 转换' : 'D4 质检' }} · {{ {running:'执行中',completed:'已完成',failed:'执行失败'}[dataJob.status] }}</b>
+                    <p>{{ dataStageLabel }} <span v-if="dataJob.progress?.total">{{ dataJob.progress.completed }} / {{ dataJob.progress.total }} · {{ dataJob.progress.percent }}%</span></p>
+                    <progress :value="dataJob.progress?.total ? dataJob.progress.percent : undefined" max="100" aria-label="当前阶段进度"></progress>
+                    <small>进度百分比对应当前阶段；阶段切换后重新计数。</small>
+                    <p v-if="dataJob.error" class="severity-error">{{ dataJob.error }}</p>
+                    <p v-if="dataJob.result?.counts">产出：训练 {{ dataJob.result.counts.train }} / 验证 {{ dataJob.result.counts.val }} / 测试 {{ dataJob.result.counts.test }} 张</p>
+                </div>
+                <div class="data-report" v-if="dataHistory.latest">
+                    <h3>{{ dataForm.dataset }} · 最新质检报告 <span :class="severityClass(dataHistory.latest.overall_severity)">{{ dataHistory.latest.overall_severity }}</span></h3>
+                    <p>{{ dataHistory.latest.run_id }} · {{ dataHistory.latest.duration_seconds }} 秒 · {{ dataHistory.latest.results.length }} 项检查</p>
+                    <div class="data-table-wrap"><table class="data-table"><thead><tr><th>检查项</th><th>结论</th><th>说明</th></tr></thead><tbody><tr v-for="item in dataHistory.latest.results" :key="item.name"><td>{{ item.name }}</td><td :class="severityClass(item.severity)">{{ item.severity }}</td><td>{{ item.summary }}</td></tr></tbody></table></div>
+                    <h3>与上次质检对比</h3>
+                    <p v-if="!comparison.baseline_run_id">首次质检，已建立历史基线。</p>
+                    <template v-else>
+                        <p>上次运行 {{ comparison.baseline_run_id }} · 新增 {{ comparison.new_count || 0 }} · 已修复 {{ comparison.resolved_count || 0 }} · 持续存在 {{ comparison.persistent_count || 0 }}</p>
+                        <small>图片、标签、边界与契约按文件/行比较；其余原有检查按检查项比较。每类最多显示 100 条。</small>
+                        <details v-for="group in [{key:'new',label:'新增问题'},{key:'resolved',label:'已修复问题'}]" :key="group.key"><summary>{{ group.label }}（{{ comparison[group.key + '_count'] || 0 }}）</summary><ul><li v-for="(issue,index) in comparison[group.key]" :key="index">{{ issue.check }} · {{ issue.split }} / {{ issue.file || '检查项' }} {{ issue.line_no ? '第 ' + issue.line_no + ' 行' : '' }} · {{ issue.kind }} {{ issue.message }}</li></ul></details>
+                        <p v-for="item in comparison.severity_changes" :key="item.check">{{ item.check }}：{{ item.before }} → {{ item.after }}</p>
+                    </template>
+                    <details><summary>最近 {{ dataHistory.reports.length }} 次质检记录</summary><ul><li v-for="item in dataHistory.reports" :key="item.run_id">{{ item.run_id }} · {{ item.severity }} · {{ item.n_checks }} 项 · {{ item.duration_seconds }} 秒</li></ul></details>
+                </div>
+                <p v-else class="chart-note">此数据集暂无历史质检报告，请运行 D4 建立基线。</p>
+                <!-- 新增代码结束 -->
                 <div class="pipeline">
                     <div><b>RAW</b><span>原始 YOLO 图片与标签</span></div><i>→</i>
                     <div><b>TRANSFORM</b><span>格式校验、固定划分、物化</span></div><i>→</i>
-                    <div><b>VALIDATE</b><span>15 项质量检查</span></div><i>→</i>
+                    <div><b>VALIDATE</b><span>{{ engineering.checks.length }} 项质量检查与历史对比</span></div><i>→</i>
                     <div><b>READY</b><span>可重复训练的数据集 YAML</span></div>
                 </div>
             </div>

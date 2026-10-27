@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding:utf-8 -*-
 # @FileName  : snapshot.py
 # @Author    : ODPlatform Team
 # @Project   : ODPlatform
@@ -7,16 +6,17 @@
 """数据集快照:把 yaml + 磁盘状态装进一个只读数据结构,供所有 check 共享。
 装数据的，不下结论 —— snapshot 只负责"如实呈现",判断是 check 的事。
 """
+
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import yaml
 
 from od_platform.common.constants import IMAGE_EXTENSIONS, Task
+from od_platform.common.progress import track
 from od_platform.data_validation.labels import parse_label_line
 
 logger = logging.getLogger(__name__)
@@ -27,30 +27,32 @@ _SPLITS = ("train", "val", "test")
 @dataclass(frozen=True)
 class SplitStats:
     """单个 split 的有界聚合统计(内存占用与样本数无关)。"""
+
     image_count: int = 0
-    annotated_count: int = 0                        # 有 ≥1 个有效框的图数
-    instance_count: int = 0                         # 有效框总数
-    class_instances: Dict[int, int] = field(default_factory=dict)
+    annotated_count: int = 0  # 有 ≥1 个有效框的图数
+    instance_count: int = 0  # 有效框总数
+    class_instances: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
 class DatasetSnapshot:
     """一次质检运行共享的数据集快照。"""
+
     yaml_path: Path
-    yaml_data: Dict = field(default_factory=dict)
-    yaml_load_error: Optional[str] = None
-    data_root: Optional[Path] = None
-    nc: Optional[int] = None
-    class_names: List[str] = field(default_factory=list)
+    yaml_data: dict = field(default_factory=dict)
+    yaml_load_error: str | None = None
+    data_root: Path | None = None
+    nc: int | None = None
+    class_names: list[str] = field(default_factory=list)
     task_type: str = Task.DETECT
-    images_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)
-    labels_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)        # 期望存在
-    label_files_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)   # 磁盘实有
-    stats_per_split: Dict[str, SplitStats] = field(default_factory=dict)
-    scan_warnings: List[str] = field(default_factory=list)
+    images_per_split: dict[str, tuple[Path, ...]] = field(default_factory=dict)
+    labels_per_split: dict[str, tuple[Path, ...]] = field(default_factory=dict)  # 期望存在
+    label_files_per_split: dict[str, tuple[Path, ...]] = field(default_factory=dict)  # 磁盘实有
+    stats_per_split: dict[str, SplitStats] = field(default_factory=dict)
+    scan_warnings: list[str] = field(default_factory=list)
 
     @property
-    def splits(self) -> List[str]:
+    def splits(self) -> list[str]:
         return sorted(self.images_per_split)
 
     @property
@@ -60,7 +62,8 @@ class DatasetSnapshot:
 
 # ---------------------------------------------------------------- 内部装配
 
-def _load_yaml(yaml_path: Path) -> Tuple[Dict, Optional[str]]:
+
+def _load_yaml(yaml_path: Path) -> tuple[dict, str | None]:
     try:
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
     except Exception as e:
@@ -70,7 +73,7 @@ def _load_yaml(yaml_path: Path) -> Tuple[Dict, Optional[str]]:
     return data, None
 
 
-def _resolve_data_root(yaml_path: Path, data: Dict) -> Optional[Path]:
+def _resolve_data_root(yaml_path: Path, data: dict) -> Path | None:
     raw = data.get("path")
     if not raw:
         return None
@@ -78,7 +81,7 @@ def _resolve_data_root(yaml_path: Path, data: Dict) -> Optional[Path]:
     return p if p.is_absolute() else (yaml_path.parent / p).resolve()
 
 
-def _list_images(split_dir: Path) -> Tuple[Path, ...]:
+def _list_images(split_dir: Path) -> tuple[Path, ...]:
     exts = {e.lower() for e in IMAGE_EXTENSIONS} | {e.upper() for e in IMAGE_EXTENSIONS}
     return tuple(sorted(p for p in split_dir.iterdir() if p.suffix in exts))
 
@@ -91,12 +94,12 @@ def _label_path_for_image(img: Path) -> Path:
     return Path(*parts).with_suffix(".txt")
 
 
-def _list_label_files(data_root: Path, split: str) -> Tuple[Path, ...]:
+def _list_label_files(data_root: Path, split: str) -> tuple[Path, ...]:
     d = data_root / "labels" / split
     return tuple(sorted(d.glob("*.txt"))) if d.exists() else ()
 
 
-def _normalize_names(names) -> List[str]:
+def _normalize_names(names) -> list[str]:
     if isinstance(names, dict):
         return [names[i] for i in sorted(names)]
     if isinstance(names, list):
@@ -109,13 +112,13 @@ def _build_stats(snap: DatasetSnapshot) -> None:
     nc = snap.nc
     for split, label_paths in snap.labels_per_split.items():
         n_annotated = n_inst = 0
-        class_inst: Dict[int, int] = {}
-        for lbl in label_paths:
+        class_inst: dict[int, int] = {}
+        for lbl in track(label_paths, f"snapshot:{split}"):
             if not lbl.exists():
                 continue
             try:
                 text = lbl.read_text(encoding="utf-8")
-            except OSError:
+            except (OSError, UnicodeError):
                 continue
             n_valid = 0
             for line in text.splitlines():
@@ -136,16 +139,17 @@ def _build_stats(snap: DatasetSnapshot) -> None:
             image_count=len(snap.images_per_split.get(split, ())),
             annotated_count=n_annotated,
             instance_count=n_inst,
-            class_instances=class_inst)
+            class_instances=class_inst,
+        )
 
 
-def build_snapshot(yaml_path: Path, task_type: Optional[str] = None) -> DatasetSnapshot:
+def build_snapshot(yaml_path: Path, task_type: str | None = None) -> DatasetSnapshot:
     yaml_path = Path(yaml_path)
     snap = DatasetSnapshot(yaml_path=yaml_path)
     data, err = _load_yaml(yaml_path)
     snap.yaml_data, snap.yaml_load_error = data, err
     if err:
-        return snap                                     # yaml 都读不了,后续 check 各自早返回
+        return snap  # yaml 都读不了,后续 check 各自早返回
 
     snap.data_root = _resolve_data_root(yaml_path, data)
     nc = data.get("nc")
@@ -155,8 +159,9 @@ def build_snapshot(yaml_path: Path, task_type: Optional[str] = None) -> DatasetS
     odp_meta = data.get("odp_meta") or {}
     resolved = task_type or odp_meta.get("task") or Task.DETECT
     if task_type and odp_meta.get("task") and task_type != odp_meta["task"]:
-        logger.warning("task_type=%s 与 yaml odp_meta.task=%s 不一致,以参数为准",
-                       task_type, odp_meta["task"])
+        logger.warning(
+            "task_type=%s 与 yaml odp_meta.task=%s 不一致,以参数为准", task_type, odp_meta["task"]
+        )
     snap.task_type = resolved
 
     if snap.data_root is None or not snap.data_root.exists():

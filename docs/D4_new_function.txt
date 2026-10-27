@@ -1,0 +1,5031 @@
+# D4 · 数据验证（精简实操版）
+
+> 本文件是原讲义《D4 数据验证（上/下）》的精简实操版：**只讲正确做法，去掉试错演绎**。代码为终版，并已在干净环境端到端实测通过（含全部 pytest）。
+>
+> 与原讲义的关系：原讲义下篇有 6 个 check 只给了设计卡与关键片段、测试 fixtures 只给了名字；本版按设计卡补全为完整可运行代码，行为与设计卡一致，示例输出全部来自真实运行。
+
+---
+
+## 0. 本课做什么
+
+一句话：**一条 `odp-validate` 命令，对 D3 产出的数据集做 15 项只读质检，按严重度聚合成退出码——ERROR 拦停（2）、WARNING 提醒（1）、PASS/INFO 放行（0）。**
+
+```
+configs/datasets/demo.yaml ──┐
+runs/data_pipeline/<run_id>/manifest.json ──┤
+data/processed/demo/ ──┐     │
+                       ▼     ▼
+              DatasetSnapshot（只读快照）
+                       │
+              15 个 check（注册表自动发现）
+                       │
+              ValidationReport ──→ logger + json + csv
+                       │
+              退出码:ERROR→2 / WARNING→1 / PASS·INFO→0
+```
+
+三条硬规则：
+
+1. **质检只读**：任何 check 不得改数据；发现问题→人去修源头（或重跑 D3），再质检；
+2. **判断分级，不二元**：ERROR=必须修，WARNING=可训但建议修，INFO=提示，PASS=通过；退出码取全场最严；
+3. **契约对账不互信**：D4 不 import D3 的任何模块，只认公共契约 `common/lineage.py`——拿 manifest 重算指纹、逐样本核验 sha256。
+
+**前置**：D3 已完成，`configs/datasets/demo.yaml` + manifest 存在。本课新增：
+
+```
+apps/platform/src/od_platform/
+├── cli/validate_data.py                  # odp-validate 命令
+└── data_validation/
+    ├── registry.py                       # CheckSeverity/CheckResult/CheckContext + 注册表
+    ├── snapshot.py                       # DatasetSnapshot:结构层 + 内容层(SplitStats)
+    ├── labels.py                         # 标签行解析:全框架唯一权威
+    ├── service.py                        # run_all_checks + validate_dataset
+    ├── report.py                         # ValidationReport:logger/json/csv 三出口
+    └── checks/                           # 15 个 check,一个文件一个,自动发现
+        ├── _lineage.py                   #   (内部件)从 yaml 加载 manifest
+        ├── yaml_schema.py  pair_existence.py  fingerprint_match.py  manifest_lineage.py
+        ├── label_format.py  bbox_within_image.py  box_geometry.py  duplicate_annotations.py
+        ├── annotation_coverage.py  orphan_labels.py  stem_collision.py
+        ├── split_presence.py  split_uniqueness.py  class_presence.py  class_balance.py
+apps/platform/tests/conftest.py           # 测试夹具(全部基于真实产物的拷贝)
+apps/platform/tests/test_data_validation.py
+```
+
+15 个 check 一览（按职能分组）：
+
+| 组 | check | 一句话 |
+|---|---|---|
+| 配置 | `yaml_schema` | yaml 结构合法吗 |
+| 配对 | `pair_existence` / `orphan_labels` / `stem_collision` | 图↔标签配对（缺失/孤儿/同名冲突） |
+| 契约 | `fingerprint_match` / `manifest_lineage` | 对 D3 的账：指纹三方一致 / 逐样本核验 |
+| 标注内容 | `label_format` / `bbox_within_image` / `box_geometry` / `duplicate_annotations` | 行合法 / 框在界内 / 框有几何意义 / 无重复行 |
+| 统计 | `annotation_coverage` / `split_presence` / `split_uniqueness` / `class_presence` / `class_balance` | 标注覆盖 / 划分齐备 / 无泄漏 / 类别出现性 / 长尾提醒 |
+
+---
+
+## 1. common 层增量
+
+### 1.1 `common/constants.py` 追加
+
+```python
+# apps/platform/src/od_platform/common/constants.py(D4 增量:追加到文件尾部)
+
+# ---- D4 质检阈值(阈值是业务决策,进 constants;check 里不写魔法数) ----
+PAIR_MISSING_ERROR_RATIO: float = 0.5    # 缺标签图占比 ≥ 此值 → ERROR(疑似导出中断)
+PAIR_MISSING_WARN_RATIO: float = 0.05    # ≥ 此值 → WARNING
+PAIR_MAX_DETAIL: int = 20                # details 里缺失清单的展示上限
+LINEAGE_MAX_DETAIL: int = 20             # manifest_lineage 的问题清单展示上限
+DETAILS_PREVIEW_LIMIT: int = 20          # 各 check details 预览列表的统一上限
+BBOX_EDGE_TOLERANCE: float = 1e-6        # 出界判定的浮点容差
+BBOX_OUT_ERROR_RATIO: float = 0.10       # 出界框占比 ≥ 10% → ERROR,否则 WARNING
+DEGENERATE_BOX_MIN_SIZE: float = 1e-3    # 框宽/高/面积低于此值 → 退化框
+UNLABELED_WARN_RATIO: float = 0.30       # 无标注图占比 ≥ 此值 → WARNING
+UNLABELED_INFO_RATIO: float = 0.05       # ≥ 此值 → INFO
+SPLIT_MIN_IMAGES: int = 30               # split 图数低于此值 → INFO(评估方差偏大)
+CLASS_IMBALANCE_INFO_RATIO: float = 10.0 # 类别失衡比 ≥ 此值 → INFO(≥50 由 STATS_MAX 接管)
+ORPHAN_LABELS_WARN_RATIO: float = 0.10   # 孤儿标签占比 ≥ 此值 → WARNING
+```
+
+### 1.2 `common/paths.py` 追加
+
+```python
+# apps/platform/src/od_platform/common/paths.py(D4 增量:追加到文件尾部)
+
+VALIDATION_RUNS_DIR: Path = RUNS_DIR / "data_validation"   # 质检报告的家(按需创建,不进 init 清单)
+
+
+def validation_run_dir(run_id: str) -> Path:
+    return VALIDATION_RUNS_DIR / run_id
+```
+
+---
+
+## 2. `data_validation/registry.py`：严重度 + 结果 + 注册表
+
+与 D3 同一注册表模式（模块级 dict + 装饰器自注册 + 懒加载自动发现），加格式/策略/质检项都是"加一个文件"。
+
+```python
+# apps/platform/src/od_platform/data_validation/registry.py
+"""质检注册表 + 严重度 + 结果类型 + 执行上下文。
+
+严重度四级:ERROR(必须修)> WARNING(可训但建议修)> INFO(提示)> PASS(通过);
+rank() 供聚合取"全场最严"。重复注册直接 ValueError —— 静默覆盖等于埋雷。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List
+
+from od_platform.data_validation.snapshot import DatasetSnapshot
+
+
+class CheckSeverity:
+    ERROR = "ERROR"
+    WARNING = "WARNING"
+    INFO = "INFO"
+    PASS = "PASS"
+
+    _ORDER = {ERROR: 3, WARNING: 2, INFO: 1, PASS: 0}
+
+    @classmethod
+    def rank(cls, severity: str) -> int:
+        return cls._ORDER[severity]
+
+
+@dataclass
+class CheckResult:
+    name: str
+    severity: str
+    summary: str                                     # 一句话结论(给人看)
+    details: Dict[str, Any] = field(default_factory=dict)  # 结构化证据(给程序看)
+
+    @property
+    def passed(self) -> bool:
+        return self.severity in (CheckSeverity.PASS, CheckSeverity.INFO)
+
+
+@dataclass
+class CheckContext:
+    """一次质检运行共享的上下文。"""
+    yaml_path: Path
+    snapshot: DatasetSnapshot
+
+
+CheckFunc = Callable[[CheckContext], CheckResult]
+
+
+@dataclass(frozen=True)
+class CheckEntry:
+    name: str
+    func: CheckFunc
+
+
+_REGISTRY: Dict[str, CheckEntry] = {}
+_LAZY_INITIALIZED = False
+
+
+def check(name: str):
+    """装饰器:把函数注册为质检项。"""
+    def deco(func: CheckFunc) -> CheckFunc:
+        if name in _REGISTRY:
+            raise ValueError(f"质检项重复注册: {name!r}")
+        _REGISTRY[name] = CheckEntry(name=name, func=func)
+        return func
+    return deco
+
+
+def _lazy_init() -> None:
+    global _LAZY_INITIALIZED
+    if _LAZY_INITIALIZED:
+        return
+    from od_platform.common.registry_utils import import_submodules
+    from od_platform.data_validation import checks
+    import_submodules(checks)
+    _LAZY_INITIALIZED = True
+
+
+def get_all_checks() -> List[CheckEntry]:
+    _lazy_init()
+    return [_REGISTRY[k] for k in sorted(_REGISTRY)]
+
+
+def get_check(name: str) -> CheckEntry:
+    _lazy_init()
+    return _REGISTRY[name]          # 名字写错就该炸(KeyError)
+
+
+def list_check_names() -> List[str]:
+    _lazy_init()
+    return sorted(_REGISTRY)
+```
+
+`data_validation/__init__.py` 与 `data_validation/checks/__init__.py`：
+
+```python
+# apps/platform/src/od_platform/data_validation/__init__.py
+"""data_validation - 数据质检子系统(只读;15 项 check 自动发现)"""
+```
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/__init__.py
+"""checks - 质检项实现(装饰器自注册;下划线开头为内部工具,不被自动导入)"""
+```
+
+---
+
+## 3. `snapshot.py`：数据集快照（加载数据，不下结论）
+
+快照是全部 check 的共享输入，原则：**只如实呈现，不做判断**（判断是 check 的事）。两个层次：
+
+- **结构层**：yaml 解析结果、数据集根、类名表、各 split 的图像清单/应有标签路径/实有标签文件、扫描告警；
+- **内容层**：每个 split 的 `SplitStats` 有界聚合（图数/有标注图数/实例数/各类实例数）——统计类 check 零 I/O 消费；逐框明细不设上限、不进快照，几何类 check 需要时按需重读文件。
+
+两套标签清单别搞混：`labels_per_split` = 按图像清单**期望存在**的标签路径（用于查缺失）；`label_files_per_split` = 磁盘上**实际存在**的 .txt（用于解析内容、查孤儿）。
+
+```python
+# apps/platform/src/od_platform/data_validation/snapshot.py
+"""数据集快照:把 yaml + 磁盘状态装进一个只读数据结构,供所有 check 共享。
+装数据的，不下结论 —— snapshot 只负责"如实呈现",判断是 check 的事。
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import yaml
+
+from od_platform.common.constants import IMAGE_EXTENSIONS, Task
+from od_platform.data_validation.labels import parse_label_line
+
+logger = logging.getLogger(__name__)
+
+_SPLITS = ("train", "val", "test")
+
+
+@dataclass(frozen=True)
+class SplitStats:
+    """单个 split 的有界聚合统计(内存占用与样本数无关)。"""
+    image_count: int = 0
+    annotated_count: int = 0                        # 有 ≥1 个有效框的图数
+    instance_count: int = 0                         # 有效框总数
+    class_instances: Dict[int, int] = field(default_factory=dict)
+
+
+@dataclass
+class DatasetSnapshot:
+    """一次质检运行共享的数据集快照。"""
+    yaml_path: Path
+    yaml_data: Dict = field(default_factory=dict)
+    yaml_load_error: Optional[str] = None
+    data_root: Optional[Path] = None
+    nc: Optional[int] = None
+    class_names: List[str] = field(default_factory=list)
+    task_type: str = Task.DETECT
+    images_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)
+    labels_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)        # 期望存在
+    label_files_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)   # 磁盘实有
+    stats_per_split: Dict[str, SplitStats] = field(default_factory=dict)
+    scan_warnings: List[str] = field(default_factory=list)
+
+    @property
+    def splits(self) -> List[str]:
+        return sorted(self.images_per_split)
+
+    @property
+    def total_images(self) -> int:
+        return sum(len(v) for v in self.images_per_split.values())
+
+
+# ---------------------------------------------------------------- 内部装配
+
+def _load_yaml(yaml_path: Path) -> Tuple[Dict, Optional[str]]:
+    try:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {}, f"{type(e).__name__}: {e}"
+    if not isinstance(data, dict):
+        return {}, f"yaml 顶层不是 mapping: {type(data).__name__}"
+    return data, None
+
+
+def _resolve_data_root(yaml_path: Path, data: Dict) -> Optional[Path]:
+    raw = data.get("path")
+    if not raw:
+        return None
+    p = Path(raw)
+    return p if p.is_absolute() else (yaml_path.parent / p).resolve()
+
+
+def _list_images(split_dir: Path) -> Tuple[Path, ...]:
+    exts = {e.lower() for e in IMAGE_EXTENSIONS} | {e.upper() for e in IMAGE_EXTENSIONS}
+    return tuple(sorted(p for p in split_dir.iterdir() if p.suffix in exts))
+
+
+def _label_path_for_image(img: Path) -> Path:
+    """.../images/train/x.jpg → .../labels/train/x.txt(替换最后一段 images)。"""
+    parts = list(img.parts)
+    idx = len(parts) - 1 - parts[::-1].index("images")
+    parts[idx] = "labels"
+    return Path(*parts).with_suffix(".txt")
+
+
+def _list_label_files(data_root: Path, split: str) -> Tuple[Path, ...]:
+    d = data_root / "labels" / split
+    return tuple(sorted(d.glob("*.txt"))) if d.exists() else ()
+
+
+def _normalize_names(names) -> List[str]:
+    if isinstance(names, dict):
+        return [names[i] for i in sorted(names)]
+    if isinstance(names, list):
+        return list(names)
+    return []
+
+
+def _build_stats(snap: DatasetSnapshot) -> None:
+    """内容层:扫一遍期望标签路径,聚合 SplitStats。读取失败跳过(结构问题归 label_format)。"""
+    nc = snap.nc
+    for split, label_paths in snap.labels_per_split.items():
+        n_annotated = n_inst = 0
+        class_inst: Dict[int, int] = {}
+        for lbl in label_paths:
+            if not lbl.exists():
+                continue
+            try:
+                text = lbl.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            n_valid = 0
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                box, kind = parse_label_line(line, snap.task_type)
+                if box is None:
+                    continue
+                n_valid += 1
+                cid = box[0]
+                if isinstance(nc, int) and 0 <= cid < nc:
+                    class_inst[cid] = class_inst.get(cid, 0) + 1
+            if n_valid:
+                n_annotated += 1
+                n_inst += n_valid
+        snap.stats_per_split[split] = SplitStats(
+            image_count=len(snap.images_per_split.get(split, ())),
+            annotated_count=n_annotated,
+            instance_count=n_inst,
+            class_instances=class_inst)
+
+
+def build_snapshot(yaml_path: Path, task_type: Optional[str] = None) -> DatasetSnapshot:
+    yaml_path = Path(yaml_path)
+    snap = DatasetSnapshot(yaml_path=yaml_path)
+    data, err = _load_yaml(yaml_path)
+    snap.yaml_data, snap.yaml_load_error = data, err
+    if err:
+        return snap                                     # yaml 都读不了,后续 check 各自早返回
+
+    snap.data_root = _resolve_data_root(yaml_path, data)
+    nc = data.get("nc")
+    snap.nc = nc if isinstance(nc, int) else None
+    snap.class_names = _normalize_names(data.get("names"))
+
+    odp_meta = data.get("odp_meta") or {}
+    resolved = task_type or odp_meta.get("task") or Task.DETECT
+    if task_type and odp_meta.get("task") and task_type != odp_meta["task"]:
+        logger.warning("task_type=%s 与 yaml odp_meta.task=%s 不一致,以参数为准",
+                       task_type, odp_meta["task"])
+    snap.task_type = resolved
+
+    if snap.data_root is None or not snap.data_root.exists():
+        if snap.data_root is not None:
+            snap.scan_warnings.append(f"split 根目录不存在: {snap.data_root}")
+        return snap
+
+    for split in _SPLITS:
+        if split not in data:
+            continue
+        img_dir = snap.data_root / data[split]
+        if not img_dir.exists():
+            snap.scan_warnings.append(f"split '{split}' 的图像目录不存在: {img_dir}")
+            snap.images_per_split[split] = ()
+            snap.labels_per_split[split] = ()
+            snap.label_files_per_split[split] = ()
+            continue
+        images = _list_images(img_dir)
+        snap.images_per_split[split] = images
+        snap.labels_per_split[split] = tuple(_label_path_for_image(p) for p in images)
+        snap.label_files_per_split[split] = _list_label_files(snap.data_root, split)
+
+    _build_stats(snap)
+    return snap
+```
+
+---
+
+## 4. `labels.py`：标签行解析的唯一权威
+
+全框架只有这里解析标签行。**解析与判断分离**：它只说"这行是什么"（`kind`），严不严重由 check 决定。
+
+```python
+# apps/platform/src/od_platform/data_validation/labels.py
+"""YOLO 标签行解析:全框架唯一权威。
+返回 (box, kind):box=(class_id, [coords]);kind=None 表示合法;box=None 时 kind 指明原因。
+"""
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+from od_platform.common.constants import Task
+
+KIND_FIELD_COUNT = "field_count_mismatch"
+KIND_PARSE = "parse_error"
+KIND_POLY_FEW = "polygon_too_few_points"
+
+ParsedBox = Tuple[int, List[float]]
+
+
+def parse_label_line(line: str, task_type: str) -> Tuple[Optional[ParsedBox], Optional[str]]:
+    """解析一行 YOLO 标签(调用方先 strip;空行返回 (None, None))。"""
+    parts = line.split()
+    if not parts:
+        return None, None
+    n = len(parts)
+    if task_type == Task.SEGMENT:
+        if n < 7:
+            return None, KIND_POLY_FEW if n >= 3 else KIND_FIELD_COUNT
+        if n % 2 == 0:
+            return None, KIND_POLY_FEW
+    else:
+        if n != 5:
+            return None, KIND_FIELD_COUNT
+    try:
+        class_id = int(parts[0])
+        coords = [float(v) for v in parts[1:]]
+    except ValueError:
+        return None, KIND_PARSE
+    return (class_id, coords), None
+```
+
+---
+
+## 5. 配置与契约类 check（4 个 + 1 个内部件）
+
+### 5.1 `checks/yaml_schema.py`
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/yaml_schema.py
+"""check: yaml_schema —— 配置文件本身合法吗(最前置的一道)。
+yaml 无法加载是前置错,早返回;结构问题收集齐了一次报全。"""
+from __future__ import annotations
+
+from typing import List
+
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "yaml_schema"
+
+
+@check(_NAME)
+def validate_yaml_schema(ctx: CheckContext) -> CheckResult:
+    if ctx.snapshot.yaml_load_error:
+        return CheckResult(_NAME, CheckSeverity.ERROR, "yaml 无法加载",
+                           {"error": ctx.snapshot.yaml_load_error})
+    data = ctx.snapshot.yaml_data
+    problems: List[str] = []
+    nc, names = data.get("nc"), data.get("names")
+    if not isinstance(nc, int) or nc <= 0:
+        problems.append(f"nc 缺失或不是正整数: {nc!r}")
+    if not isinstance(names, (list, dict)):
+        problems.append(f"names 缺失或类型不对(应为 list/dict): {type(names).__name__}")
+    if isinstance(nc, int) and isinstance(names, (list, dict)) and len(names) != nc:
+        problems.append(f"nc={nc} 与 names 数量 {len(names)} 不一致")
+    if not data.get("path"):
+        problems.append("缺少 path 字段(数据集根目录)")
+    for s in ("train", "val", "test"):
+        if s in data and not isinstance(data[s], str):
+            problems.append(f"{s} 字段应为字符串路径: {data[s]!r}")
+    if problems:
+        return CheckResult(_NAME, CheckSeverity.ERROR,
+                           f"yaml 结构有 {len(problems)} 处问题", {"problems": problems})
+    return CheckResult(_NAME, CheckSeverity.PASS, "yaml 结构合法", {"nc": nc})
+```
+
+### 5.2 `checks/pair_existence.py`
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/pair_existence.py
+"""check: pair_existence —— 每张图都有对应标签吗(按缺失比例分级:≥50% ERROR / ≥5% WARNING)。"""
+from __future__ import annotations
+
+from typing import List
+
+from od_platform.common.constants import (
+    PAIR_MAX_DETAIL, PAIR_MISSING_ERROR_RATIO, PAIR_MISSING_WARN_RATIO,
+)
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "pair_existence"
+
+
+@check(_NAME)
+def validate_pair_existence(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    missing: List[dict] = []
+    total = 0
+    for split in snap.splits:
+        for lbl in snap.labels_per_split[split]:
+            total += 1
+            if not lbl.exists():
+                missing.append({"split": split, "expect": str(lbl)})
+    if total == 0:
+        return CheckResult(_NAME, CheckSeverity.WARNING, "数据集没有任何图像", {})
+    ratio = len(missing) / total
+    details = {"total_images": total, "missing": len(missing),
+               "missing_ratio": round(ratio, 4),
+               "missing_preview": missing[:PAIR_MAX_DETAIL],
+               "thresholds": {"error": PAIR_MISSING_ERROR_RATIO,
+                              "warn": PAIR_MISSING_WARN_RATIO}}
+    if ratio >= PAIR_MISSING_ERROR_RATIO:
+        return CheckResult(_NAME, CheckSeverity.ERROR,
+                           f"{len(missing)}/{total} 张图缺标签({ratio:.1%})— 疑似导出中断", details)
+    if ratio >= PAIR_MISSING_WARN_RATIO:
+        return CheckResult(_NAME, CheckSeverity.WARNING,
+                           f"{len(missing)}/{total} 张图缺标签({ratio:.1%})", details)
+    if missing:
+        return CheckResult(_NAME, CheckSeverity.INFO,
+                           f"{len(missing)}/{total} 张图缺标签({ratio:.1%})— 多为无目标图,确认即可",
+                           details)
+    return CheckResult(_NAME, CheckSeverity.PASS, f"全部 {total} 张图均有标签", details)
+```
+
+### 5.3 `checks/_lineage.py`（内部件）
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/_lineage.py
+"""内部工具:从 yaml 的 odp_meta 找到并加载 D3 划分契约。下划线开头,不被自动发现。"""
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+from od_platform.common import paths
+from od_platform.common.lineage import SplitManifest
+
+
+def load_manifest_from_yaml(
+    yaml_data: dict,
+) -> Tuple[Optional[SplitManifest], Optional[str], dict]:
+    """返回 (manifest, error, odp_meta);error 非空即失败原因。"""
+    odp_meta = yaml_data.get("odp_meta") or {}
+    ref = odp_meta.get("manifest_path")
+    if not ref:
+        return None, "yaml 缺少 odp_meta.manifest_path(不是 odp-transform 产出?)", odp_meta
+    mpath = paths.ROOT_DIR / ref
+    if not mpath.exists():
+        return None, f"manifest 文件不存在: {mpath}", odp_meta
+    try:
+        return SplitManifest.read(mpath), None, odp_meta
+    except Exception as e:
+        return None, f"manifest 读取失败: {type(e).__name__}: {e}", odp_meta
+```
+
+### 5.4 `checks/fingerprint_match.py`
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/fingerprint_match.py
+"""check: fingerprint_match —— 契约指纹三方对账。
+① manifest 自洽(重算 == 记录):内容没被改;② yaml 指纹 == manifest 指纹:没张冠李戴。"""
+from __future__ import annotations
+
+from od_platform.common.lineage import compute_contract_fingerprint
+from od_platform.data_validation.checks._lineage import load_manifest_from_yaml
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "fingerprint_match"
+
+
+@check(_NAME)
+def validate_fingerprint_match(ctx: CheckContext) -> CheckResult:
+    manifest, err, odp_meta = load_manifest_from_yaml(ctx.snapshot.yaml_data)
+    if err:
+        return CheckResult(_NAME, CheckSeverity.ERROR, f"拿不到 D3 划分契约: {err}", {})
+    recomputed = compute_contract_fingerprint(
+        manifest.dataset, manifest.strategy, manifest.seed, manifest.ratios,
+        manifest.names, manifest.samples, manifest.tool_version)
+    if recomputed != manifest.contract_fingerprint:
+        return CheckResult(_NAME, CheckSeverity.ERROR,
+                           "manifest 自身指纹对不上 —— 内容被改过",
+                           {"expected": manifest.contract_fingerprint,
+                            "recomputed": recomputed})
+    yaml_fp = odp_meta.get("contract_fingerprint")
+    if yaml_fp != manifest.contract_fingerprint:
+        return CheckResult(_NAME, CheckSeverity.ERROR,
+                           "yaml 指纹与 manifest 不一致 —— yaml 张冠李戴",
+                           {"yaml_fingerprint": yaml_fp,
+                            "manifest_fingerprint": manifest.contract_fingerprint})
+    return CheckResult(_NAME, CheckSeverity.PASS, "契约指纹三方一致",
+                       {"fingerprint": manifest.contract_fingerprint,
+                        "n_samples": len(manifest.samples),
+                        "strategy": manifest.strategy, "seed": manifest.seed})
+```
+
+### 5.5 `checks/manifest_lineage.py`
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/manifest_lineage.py
+"""check: manifest_lineage —— 逐样本核验:在契约说的 split 里、内容 sha256 没变。
+changed(内容变了)/ moved(split 挪了)/ missing(丢了)分开计数。"""
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+from od_platform.common.constants import LINEAGE_MAX_DETAIL
+from od_platform.data_validation.checks._lineage import load_manifest_from_yaml
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "manifest_lineage"
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@check(_NAME)
+def validate_manifest_lineage(ctx: CheckContext) -> CheckResult:
+    manifest, err, _ = load_manifest_from_yaml(ctx.snapshot.yaml_data)
+    if err:
+        return CheckResult(_NAME, CheckSeverity.ERROR, f"拿不到 D3 划分契约: {err}", {})
+    snap = ctx.snapshot
+
+    # 磁盘实况:(split, stem) → 标签路径;stem → 实际出现的 split 集合
+    disk: Dict[Tuple[str, str], Path] = {}
+    disk_splits_of_stem: Dict[str, set] = {}
+    for split in snap.splits:
+        for lbl in snap.label_files_per_split[split]:
+            disk[(split, lbl.stem)] = lbl
+            disk_splits_of_stem.setdefault(lbl.stem, set()).add(split)
+
+    changed: List[str] = []
+    moved: List[dict] = []
+    missing: List[str] = []
+    for s in manifest.samples:
+        lbl = disk.get((s.split, s.stem))
+        if lbl is None:
+            elsewhere = disk_splits_of_stem.get(s.stem)
+            if elsewhere:
+                moved.append({"stem": s.stem, "expect": s.split, "actual": sorted(elsewhere)})
+            else:
+                missing.append(s.stem)
+        elif _sha256(lbl) != s.sha256:
+            changed.append(s.stem)
+
+    details = {"n_samples": len(manifest.samples),
+               "n_changed": len(changed), "n_moved": len(moved), "n_missing": len(missing),
+               "changed_preview": changed[:LINEAGE_MAX_DETAIL],
+               "moved_preview": moved[:LINEAGE_MAX_DETAIL],
+               "missing_preview": missing[:LINEAGE_MAX_DETAIL]}
+    if changed or moved or missing:
+        return CheckResult(
+            _NAME, CheckSeverity.ERROR,
+            f"契约核验失败: changed={len(changed)} moved={len(moved)} missing={len(missing)}"
+            f" —— 与 D3 产出不一致,重跑 odp-transform 或查谁动了 processed",
+            details)
+    return CheckResult(_NAME, CheckSeverity.PASS,
+                       f"{len(manifest.samples)} 个样本逐条核验通过", details)
+```
+
+---
+
+## 6. `service.py` + `report.py`：执行与报告
+
+```python
+# apps/platform/src/od_platform/data_validation/service.py
+"""质检服务层:跑全部 check 并聚合。
+唯一的 except Exception 护栏在这里:单 check 崩溃降级为 ERROR 结果,不拖垮整场质检。"""
+from __future__ import annotations
+
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+from od_platform.common import paths
+from od_platform.data_validation.registry import (
+    CheckContext, CheckEntry, CheckResult, CheckSeverity, get_all_checks,
+)
+from od_platform.data_validation.report import ValidationReport
+from od_platform.data_validation.snapshot import build_snapshot
+
+
+def _safe_run_one(entry: CheckEntry, ctx: CheckContext) -> CheckResult:
+    try:
+        return entry.func(ctx)
+    except Exception as e:                          # noqa: BLE001 —— 护栏,必须宽
+        return CheckResult(entry.name, CheckSeverity.ERROR,
+                           f"check 自身崩溃: {type(e).__name__}: {e}",
+                           {"exception": repr(e)})
+
+
+def run_all_checks(ctx: CheckContext) -> List[CheckResult]:
+    return [_safe_run_one(e, ctx) for e in get_all_checks()]
+
+
+def validate_dataset(yaml_path, task_type: Optional[str] = None,
+                     run_id: Optional[str] = None,
+                     write_report: bool = True) -> ValidationReport:
+    """端到端:快照 → 全量 check → 报告(logger + json/csv)。"""
+    t0 = time.perf_counter()
+    run_id = run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
+    yaml_path = Path(yaml_path)
+    snapshot = build_snapshot(yaml_path, task_type=task_type)
+    results = run_all_checks(CheckContext(yaml_path=yaml_path, snapshot=snapshot))
+    report = ValidationReport(run_id=run_id, snapshot=snapshot, results=results,
+                              duration_seconds=time.perf_counter() - t0)
+    report.render_to_logger()
+    if write_report:
+        out_dir = paths.validation_run_dir(run_id)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report.write_json(out_dir / "report.json")
+        report.write_results_csv(out_dir / "results.csv")
+    return report
+```
+
+```python
+# apps/platform/src/od_platform/data_validation/report.py
+"""质检报告:纯数据 + 三种出口(logger / json / csv)。报告不含判断逻辑。"""
+from __future__ import annotations
+
+import csv
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List
+
+from od_platform.data_validation.registry import CheckResult, CheckSeverity
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ValidationReport:
+    run_id: str
+    snapshot: Any                                    # DatasetSnapshot(避免循环 import)
+    results: List[CheckResult] = field(default_factory=list)
+    duration_seconds: float = 0.0
+
+    @property
+    def overall_severity(self) -> str:
+        """全场最严:按 rank 取最大;空结果视为 PASS。"""
+        if not self.results:
+            return CheckSeverity.PASS
+        return max((r.severity for r in self.results), key=CheckSeverity.rank)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "yaml_path": str(self.snapshot.yaml_path),
+            "overall_severity": self.overall_severity,
+            "duration_seconds": round(self.duration_seconds, 3),
+            "results": [
+                {"name": r.name, "severity": r.severity,
+                 "summary": r.summary, "details": r.details}
+                for r in self.results
+            ],
+        }
+
+    def write_json(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+
+    def write_results_csv(self, path: Path) -> None:
+        """utf-8-sig 带 BOM:Excel 直接打开中文不乱码。"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["run_id", "check", "severity", "summary"])
+            for r in self.results:
+                w.writerow([self.run_id, r.name, r.severity, r.summary])
+
+    def render_to_logger(self, log=None) -> None:
+        log = log or logger
+        log.info("=" * 60)
+        log.info("数据质检报告 run_id=%s  总评: %s(%.2fs)",
+                 self.run_id, self.overall_severity, self.duration_seconds)
+        log.info("=" * 60)
+        for r in self.results:
+            log.info("[%-7s] %s: %s", r.severity, r.name, r.summary)
+        fp = next((r for r in self.results if r.name == "fingerprint_match"), None)
+        if fp and fp.details.get("fingerprint"):
+            log.info("-" * 60)
+            log.info("契约指纹: %s", fp.details["fingerprint"])
+            log.info("样本数: %s  策略: %s  种子: %s",
+                     fp.details.get("n_samples"), fp.details.get("strategy"),
+                     fp.details.get("seed"))
+```
+
+---
+
+## 7. CLI：`odp-validate`
+
+```python
+# apps/platform/src/od_platform/cli/validate_data.py
+"""odp-validate:数据质检 CLI(只读,不改任何文件)。
+退出码:ERROR→2 / WARNING→1 / PASS·INFO→0。"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+from od_platform.common import paths
+from od_platform.common.constants import Task
+from od_platform.common.logging_utils import get_logger
+from od_platform.data_validation.registry import CheckSeverity
+from od_platform.data_validation.service import validate_dataset
+
+_EXIT_CODE = {CheckSeverity.ERROR: 2, CheckSeverity.WARNING: 1,
+              CheckSeverity.INFO: 0, CheckSeverity.PASS: 0}
+
+logger = get_logger(base_path=paths.LOGGING_DIR, log_type="validate")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="odp-validate",
+                                description="数据集质检(只读):15 项 check,按最严聚合成退出码")
+    p.add_argument("yaml_path", help="数据集 yaml(如 configs/datasets/demo.yaml)")
+    p.add_argument("--task", default=None, choices=Task.all(),
+                   help="不传则取 yaml 里 odp_meta.task")
+    p.add_argument("--run-id", default=None)
+    p.add_argument("--no-report", action="store_true", help="不写 json/csv 报告")
+    args = p.parse_args(argv)
+    report = validate_dataset(Path(args.yaml_path), task_type=args.task,
+                              run_id=args.run_id, write_report=not args.no_report)
+    return _EXIT_CODE.get(report.overall_severity, 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+注册命令并重装：
+
+```toml
+# apps/platform/pyproject.toml([project.scripts] 内追加)
+odp-validate = "od_platform.cli.validate_data:main"
+```
+
+```bash
+pip install -e ./apps/platform
+```
+
+> 注意：先跑通第 8 节的前 4 个 check，再写第 9 节的 11 个——但 CLI 现在就能用（自动发现，写几个跑几个）。
+
+---
+
+## 8. 标注内容类 check（4 个）
+
+### 8.1 `checks/label_format.py`
+
+与几何类 check 的分工：这里管"行本身合法不合法"（列数/数值/类别范围/坐标区间），几何 check 管"框相对图像出不出界、有没有意义"。**结构错误的行在这里报一次，几何类 check 跳过不重复报。任何一行坏 → ERROR**（坏行进训练就是炸，没有"比例容忍"）。
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/label_format.py
+"""check: label_format —— 每行标签的结构与取值合法吗。任何一行坏 → ERROR。"""
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+
+from od_platform.common.constants import DETAILS_PREVIEW_LIMIT
+from od_platform.data_validation.labels import ParsedBox, parse_label_line
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "label_format"
+KIND_CLASS_ID_OUT_OF_RANGE = "class_id_out_of_range"
+KIND_COORD_OUT_OF_RANGE = "coord_out_of_range"
+
+
+def _validate_one_line(line: str, task_type: str,
+                       nc: int) -> Tuple[Optional[ParsedBox], Optional[str]]:
+    """纯函数:(box, kind);kind=None 即合法。"""
+    box, kind = parse_label_line(line, task_type)
+    if box is None:
+        return None, kind
+    class_id, coords = box
+    if not (0 <= class_id < nc):
+        return None, KIND_CLASS_ID_OUT_OF_RANGE
+    if any(v < 0 or v > 1 for v in coords):
+        return None, KIND_COORD_OUT_OF_RANGE
+    return box, None
+
+
+@check(_NAME)
+def validate_label_format(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    nc = snap.nc
+    if not isinstance(nc, int):
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           "nc 不可用,跳过(见 yaml_schema)", {"reason": "nc_unavailable"})
+    bad_lines: List[dict] = []
+    error_kinds: Dict[str, int] = {}
+    n_bad = n_total = 0
+    for split in snap.splits:
+        for lbl in snap.label_files_per_split[split]:
+            try:
+                text = lbl.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for line_no, line in enumerate(text.splitlines(), 1):
+                line = line.strip()
+                if not line:
+                    continue
+                n_total += 1
+                _box, kind = _validate_one_line(line, snap.task_type, nc)
+                if kind is not None:
+                    n_bad += 1
+                    error_kinds[kind] = error_kinds.get(kind, 0) + 1
+                    if len(bad_lines) < DETAILS_PREVIEW_LIMIT:
+                        bad_lines.append({"split": split, "label": str(lbl),
+                                          "line_no": line_no, "kind": kind,
+                                          "line": line})
+    if n_bad == 0:
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           f"全部 {n_total} 行标签结构与取值合法", {"total_lines": n_total})
+    return CheckResult(_NAME, CheckSeverity.ERROR,
+                       f"{n_bad}/{n_total} 行标签非法({error_kinds})",
+                       {"total_lines": n_total, "n_bad": n_bad,
+                        "error_kinds": error_kinds, "bad_lines_preview": bad_lines})
+```
+
+### 8.2 `checks/bbox_within_image.py`
+
+出界判断用 `cx±w/2` 合并（左/右/上/下四个方向取最大出界量），容差 `BBOX_EDGE_TOLERANCE`。segment 任务显式 PASS 并说明原因（多边形顶点允许在外）。
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/bbox_within_image.py
+"""check: bbox_within_image —— 框相对图像出不出界(cx±w/2 合并判断)。
+≥10% 出界 → ERROR;有但 <10% → WARNING。结构错误的行跳过(label_format 已报)。"""
+from __future__ import annotations
+
+from typing import List
+
+from od_platform.common.constants import (
+    BBOX_EDGE_TOLERANCE, BBOX_OUT_ERROR_RATIO, DETAILS_PREVIEW_LIMIT, Task,
+)
+from od_platform.data_validation.labels import parse_label_line
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "bbox_within_image"
+
+
+def _overflow_amount(coords: List[float]) -> float:
+    """cx,cy,w,h → 出界量(不出界为 0;容差 BBOX_EDGE_TOLERANCE)。"""
+    cx, cy, w, h = coords
+    overflow = max(0 - (cx - w / 2), (cx + w / 2) - 1,
+                   0 - (cy - h / 2), (cy + h / 2) - 1)
+    return max(0.0, overflow - BBOX_EDGE_TOLERANCE)
+
+
+@check(_NAME)
+def validate_bbox_within_image(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    if snap.task_type == Task.SEGMENT:
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           "task=segment,出界检查仅适用 detect(多边形顶点允许在外)",
+                           {"reason": "task_not_applicable"})
+    out_boxes: List[dict] = []
+    n_out = n_total = n_skipped = 0
+    for split in snap.splits:
+        for lbl in snap.label_files_per_split[split]:
+            try:
+                text = lbl.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for line_no, line in enumerate(text.splitlines(), 1):
+                line = line.strip()
+                if not line:
+                    continue
+                box, kind = parse_label_line(line, snap.task_type)
+                if box is None:
+                    n_skipped += 1                     # 结构错误:label_format 已报,跳过
+                    continue
+                n_total += 1
+                if _overflow_amount(box[1]) > 0:
+                    n_out += 1
+                    if len(out_boxes) < DETAILS_PREVIEW_LIMIT:
+                        out_boxes.append({"split": split, "label": str(lbl),
+                                          "line_no": line_no, "coords": box[1]})
+    details = {"total_boxes": n_total, "n_out": n_out,
+               "out_ratio": round(n_out / n_total, 4) if n_total else 0.0,
+               "skipped_structure_errors": n_skipped,
+               "thresholds": {"error_ratio": BBOX_OUT_ERROR_RATIO,
+                              "edge_tolerance": BBOX_EDGE_TOLERANCE},
+               "out_boxes_preview": out_boxes}
+    if n_total == 0:
+        return CheckResult(_NAME, CheckSeverity.PASS, "没有可检查的框", details)
+    ratio = n_out / n_total
+    if ratio >= BBOX_OUT_ERROR_RATIO:
+        return CheckResult(_NAME, CheckSeverity.ERROR,
+                           f"{n_out}/{n_total} 个框出界({ratio:.1%})", details)
+    if n_out:
+        return CheckResult(_NAME, CheckSeverity.WARNING,
+                           f"{n_out}/{n_total} 个框出界({ratio:.1%})— 少量,建议修源数据",
+                           details)
+    return CheckResult(_NAME, CheckSeverity.PASS, f"全部 {n_total} 个框均在图像内", details)
+```
+
+### 8.3 `checks/box_geometry.py`
+
+退化框 + 极端宽高比（坐标合法但几何上没有训练意义）。**if-chain 优先级**：一行只报一个问题（先退化、后极端），避免一个坏框被计两次。整体 WARNING——可训，但建议清理。
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/box_geometry.py
+"""check: box_geometry —— 退化框(零宽/零高/面积极小)+ 极端宽高比。
+if-chain 优先级:一行只报一个问题。整体 WARNING:可训但建议清理。仅适用 detect。"""
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+
+from od_platform.common.constants import (
+    DEGENERATE_BOX_MIN_SIZE, DETAILS_PREVIEW_LIMIT, STATS_MAX_ASPECT_RATIO, Task,
+)
+from od_platform.data_validation.labels import parse_label_line
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "box_geometry"
+KIND_ZERO_WIDTH = "zero_width"
+KIND_ZERO_HEIGHT = "zero_height"
+KIND_TINY_AREA = "tiny_area"
+KIND_EXTREME_AR = "extreme_aspect_ratio"
+
+
+def _geometry_issue(coords: List[float]) -> Optional[Tuple[str, str]]:
+    """(kind, detail) 或 None。if-chain:退化优先于极端宽高比。"""
+    _cx, _cy, w, h = coords
+    if w <= 0:
+        return KIND_ZERO_WIDTH, f"w={w}"
+    if h <= 0:
+        return KIND_ZERO_HEIGHT, f"h={h}"
+    if w < DEGENERATE_BOX_MIN_SIZE or h < DEGENERATE_BOX_MIN_SIZE:
+        return KIND_TINY_AREA, f"w={w}, h={h}"
+    ratio = max(w / h, h / w)
+    if ratio >= STATS_MAX_ASPECT_RATIO:
+        return KIND_EXTREME_AR, f"aspect={ratio:.1f}"
+    return None
+
+
+@check(_NAME)
+def validate_box_geometry(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    if snap.task_type != Task.DETECT:
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           f"task={snap.task_type},几何检查仅适用 detect",
+                           {"reason": "task_not_applicable"})
+    issue_kinds: Dict[str, int] = {}
+    bad_boxes: List[dict] = []
+    total_boxes = n_skipped = 0
+    for split in snap.splits:
+        for lbl in snap.label_files_per_split[split]:
+            try:
+                text = lbl.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for line_no, line in enumerate(text.splitlines(), 1):
+                line = line.strip()
+                if not line:
+                    continue
+                box, kind = parse_label_line(line, snap.task_type)
+                if box is None:
+                    n_skipped += 1
+                    continue
+                total_boxes += 1
+                issue = _geometry_issue(box[1])
+                if issue is not None:
+                    kind_s, detail = issue
+                    issue_kinds[kind_s] = issue_kinds.get(kind_s, 0) + 1
+                    if len(bad_boxes) < DETAILS_PREVIEW_LIMIT:
+                        bad_boxes.append({"split": split, "label": str(lbl),
+                                          "line_no": line_no, "kind": kind_s,
+                                          "detail": detail})
+    details = {"total_boxes": total_boxes, "issue_kinds": issue_kinds,
+               "skipped_structure_errors": n_skipped,
+               "thresholds": {"degenerate_min_size": DEGENERATE_BOX_MIN_SIZE,
+                              "max_aspect_ratio": STATS_MAX_ASPECT_RATIO},
+               "bad_boxes_preview": bad_boxes}
+    if not issue_kinds:
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           f"全部 {total_boxes} 个框几何正常(无退化框/极端宽高比)", details)
+    n_bad = sum(issue_kinds.values())
+    return CheckResult(_NAME, CheckSeverity.WARNING,
+                       f"{n_bad}/{total_boxes} 个框几何异常({issue_kinds})— 可训但建议清理",
+                       details)
+```
+
+### 8.4 `checks/duplicate_annotations.py`
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/duplicate_annotations.py
+"""check: duplicate_annotations —— 完全重复的标签行(规范化后逐行比对)。
+完全重复行虚增该类权重 → WARNING。近似重复(高 IoU)不在本课范围(details 注明)。"""
+from __future__ import annotations
+
+from collections import Counter
+from typing import List
+
+from od_platform.common.constants import DETAILS_PREVIEW_LIMIT
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "duplicate_annotations"
+
+
+@check(_NAME)
+def validate_duplicate_annotations(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    dup_rows = 0
+    files_with_dup = 0
+    previews: List[dict] = []
+    for split in snap.splits:
+        for lbl in snap.label_files_per_split[split]:
+            try:
+                lines = [l.strip() for l in lbl.read_text(encoding="utf-8").splitlines()
+                         if l.strip()]
+            except OSError:
+                continue
+            counts = Counter(lines)
+            dups = {l: n for l, n in counts.items() if n > 1}
+            if dups:
+                files_with_dup += 1
+                dup_rows += sum(n - 1 for n in dups.values())
+                if len(previews) < DETAILS_PREVIEW_LIMIT:
+                    previews.append({"split": split, "label": str(lbl), "dup": dups})
+    details = {"dup_rows": dup_rows, "files_with_dup": files_with_dup,
+               "previews": previews,
+               "note": "近似重复(高 IoU)未在本课范围,如需请另做 embedding/IoU 方案"}
+    if dup_rows == 0:
+        return CheckResult(_NAME, CheckSeverity.PASS, "无完全重复的标注行", details)
+    return CheckResult(_NAME, CheckSeverity.WARNING,
+                       f"{dup_rows} 行完全重复(分布在 {files_with_dup} 个文件)— 会虚增权重",
+                       details)
+```
+
+---
+
+## 9. 统计类 check（7 个）
+
+### 9.1 `checks/annotation_coverage.py`（零额外 I/O，直接消费 SplitStats）
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/annotation_coverage.py
+"""check: annotation_coverage —— 无标注图占比。零额外 I/O:直接消费 snapshot 的 SplitStats。
+≥30% WARNING / ≥5% INFO / 否则 PASS。"""
+from __future__ import annotations
+
+from od_platform.common.constants import UNLABELED_INFO_RATIO, UNLABELED_WARN_RATIO
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "annotation_coverage"
+
+
+@check(_NAME)
+def validate_annotation_coverage(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    total_img = sum(st.image_count for st in snap.stats_per_split.values())
+    if total_img == 0:
+        return CheckResult(_NAME, CheckSeverity.INFO, "数据集没有图像", {})
+    unlabeled = sum(st.image_count - st.annotated_count
+                    for st in snap.stats_per_split.values())
+    ratio = unlabeled / total_img
+    details = {"total_images": total_img, "unlabeled": unlabeled,
+               "unlabeled_ratio": round(ratio, 4),
+               "thresholds": {"warn": UNLABELED_WARN_RATIO, "info": UNLABELED_INFO_RATIO},
+               "per_split": {s: {"images": st.image_count, "annotated": st.annotated_count}
+                             for s, st in snap.stats_per_split.items()}}
+    if ratio >= UNLABELED_WARN_RATIO:
+        return CheckResult(_NAME, CheckSeverity.WARNING,
+                           f"{unlabeled}/{total_img} 张图无有效标注({ratio:.1%})— 占比偏高",
+                           details)
+    if ratio >= UNLABELED_INFO_RATIO:
+        return CheckResult(_NAME, CheckSeverity.INFO,
+                           f"{unlabeled}/{total_img} 张图无有效标注({ratio:.1%})", details)
+    return CheckResult(_NAME, CheckSeverity.PASS,
+                       f"全部 {total_img} 张图均有有效标注", details)
+```
+
+### 9.2 `checks/orphan_labels.py`（pair_existence 的镜像）
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/orphan_labels.py
+"""check: orphan_labels —— 有标签没图的孤儿 .txt。占比 ≥10% WARNING,有但 <10% INFO。"""
+from __future__ import annotations
+
+from typing import List
+
+from od_platform.common.constants import DETAILS_PREVIEW_LIMIT, ORPHAN_LABELS_WARN_RATIO
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "orphan_labels"
+
+
+@check(_NAME)
+def validate_orphan_labels(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    orphans: List[dict] = []
+    total_labels = 0
+    for split in snap.splits:
+        image_stems = {img.stem for img in snap.images_per_split.get(split, ())}
+        files = snap.label_files_per_split.get(split, ())
+        total_labels += len(files)
+        for lbl in files:
+            if lbl.stem not in image_stems:
+                orphans.append({"split": split, "label": str(lbl)})
+    if not orphans:
+        return CheckResult(_NAME, CheckSeverity.PASS, "无孤儿标签", {})
+    ratio = len(orphans) / max(total_labels, 1)
+    details = {"n_orphans": len(orphans), "total_label_files": total_labels,
+               "orphan_ratio": round(ratio, 4),
+               "orphans_preview": orphans[:DETAILS_PREVIEW_LIMIT],
+               "thresholds": {"warn": ORPHAN_LABELS_WARN_RATIO}}
+    if ratio >= ORPHAN_LABELS_WARN_RATIO:
+        return CheckResult(_NAME, CheckSeverity.WARNING,
+                           f"{len(orphans)} 个孤儿标签({ratio:.1%})— 疑似图被删了", details)
+    return CheckResult(_NAME, CheckSeverity.INFO,
+                       f"{len(orphans)} 个孤儿标签({ratio:.1%})", details)
+```
+
+### 9.3 `checks/stem_collision.py`
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/stem_collision.py
+"""check: stem_collision —— 同 split 内同名多扩展名(a.jpg+a.png → 抢同一个 a.txt)。"""
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import List
+
+from od_platform.common.constants import DETAILS_PREVIEW_LIMIT
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "stem_collision"
+
+
+@check(_NAME)
+def validate_stem_collision(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    collisions: List[dict] = []
+    for split in snap.splits:
+        by_stem = defaultdict(list)
+        for img in snap.images_per_split[split]:
+            by_stem[img.stem].append(img.name)
+        for stem, names in sorted(by_stem.items()):
+            if len(names) > 1:
+                collisions.append({"split": split, "stem": stem, "files": sorted(names)})
+    if not collisions:
+        return CheckResult(_NAME, CheckSeverity.PASS, "无同名多扩展名冲突", {})
+    return CheckResult(_NAME, CheckSeverity.WARNING,
+                       f"{len(collisions)} 个同名多扩展名冲突 — 多张图映射到同一标签,需人工裁决",
+                       {"collisions_preview": collisions[:DETAILS_PREVIEW_LIMIT]})
+```
+
+### 9.4 `checks/split_presence.py`
+
+兑付 snapshot 的 `scan_warnings`（扫描时没资格下结论，这里下结论）：train 不可用 → ERROR；未声明 val → WARNING；未声明 test → INFO；split 规模过小 → INFO。
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/split_presence.py
+"""check: split_presence —— yaml 声明的划分真的可用吗(兑付 snapshot 的 scan_warnings)。
+train 缺失 ERROR;未声明 val WARNING;未声明 test INFO;split 图数 <30 INFO。整体取最严。"""
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from od_platform.common.constants import SPLIT_MIN_IMAGES
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "split_presence"
+
+
+@check(_NAME)
+def validate_split_presence(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    findings: List[Dict[str, Any]] = []
+    for w in snap.scan_warnings:
+        if "split" in w:
+            findings.append({"severity": CheckSeverity.WARNING, "message": w})
+    declared = [s for s in ("train", "val", "test") if s in snap.yaml_data]
+    if "train" not in snap.splits:
+        findings.append({"severity": CheckSeverity.ERROR,
+                         "message": "train 划分不可用 — 无训练数据,流程必须终止"})
+    if "val" not in declared:
+        findings.append({"severity": CheckSeverity.WARNING,
+                         "message": "yaml 未声明 val 划分 — 训练将盲飞(无验证集)"})
+    if "test" not in declared:
+        findings.append({"severity": CheckSeverity.INFO,
+                         "message": "yaml 未声明 test 划分 — 无最终诚实评估"})
+    for s in snap.splits:
+        n = len(snap.images_per_split[s])
+        if n < SPLIT_MIN_IMAGES:
+            findings.append({"severity": CheckSeverity.INFO,
+                             "message": f"{s} 划分共 {n} 张,低于 {SPLIT_MIN_IMAGES},"
+                                        f"评估方差偏大(提示)"})
+    if not findings:
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           "train/val/test 三划分齐备且规模足够", {})
+    severity = max((f["severity"] for f in findings), key=CheckSeverity.rank)
+    summary = next(f["message"] for f in findings if f["severity"] == severity)
+    return CheckResult(_NAME, severity, summary, {"findings": findings})
+```
+
+### 9.5 `checks/split_uniqueness.py`
+
+**数据泄漏是硬错误，没有比例分级**：一个 stem 出现在多个 split → ERROR。
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/split_uniqueness.py
+"""check: split_uniqueness —— 一个样本只能属于一个 split。泄漏是硬 ERROR,没有分级。"""
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import List
+
+from od_platform.common.constants import DETAILS_PREVIEW_LIMIT
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "split_uniqueness"
+
+
+@check(_NAME)
+def validate_split_uniqueness(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    splits_of_stem = defaultdict(list)
+    for split in snap.splits:
+        for img in snap.images_per_split[split]:
+            splits_of_stem[img.stem].append(split)
+    leaked: List[dict] = [{"stem": stem, "splits": sorted(ss)}
+                          for stem, ss in sorted(splits_of_stem.items()) if len(ss) > 1]
+    if not leaked:
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           f"全部 {len(splits_of_stem)} 个样本分属唯一 split", {})
+    return CheckResult(_NAME, CheckSeverity.ERROR,
+                       f"{len(leaked)} 个样本泄漏到多个 split — 数据泄漏,评估不可信",
+                       {"leaked_preview": leaked[:DETAILS_PREVIEW_LIMIT]})
+```
+
+### 9.6 `checks/class_presence.py`
+
+每个声明的类别，在该出现的划分里出现了吗：全集 0 实例 → INFO（死类别）；val/test 有而 train 没有 → WARNING（模型学不到，评估必然失真）；train 有而 val 没有 → WARNING（训练效果不可评估）。
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/class_presence.py
+"""check: class_presence —— 每个声明的类别,在该出现的划分里出现了吗。"""
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "class_presence"
+
+
+def _count(snap, split: str, cid: int) -> int:
+    st = snap.stats_per_split.get(split)
+    return st.class_instances.get(cid, 0) if st else 0
+
+
+@check(_NAME)
+def validate_class_presence(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    nc = snap.nc
+    if not isinstance(nc, int):
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           "nc 不可用,跳过类别出现性检查(见 yaml_schema)",
+                           {"reason": "nc_unavailable"})
+    findings: List[Dict[str, Any]] = []
+    for cid in range(nc):
+        name = snap.class_names[cid] if cid < len(snap.class_names) else str(cid)
+        n_tr = _count(snap, "train", cid)
+        n_va = _count(snap, "val", cid)
+        n_te = _count(snap, "test", cid)
+        if n_tr + n_va + n_te == 0:
+            findings.append({"kind": "declared_unused", "severity": CheckSeverity.INFO,
+                             "class": name,
+                             "message": f"类别 {name!r} 全集 0 实例 — 类别表与标注脱节(死类别)"})
+        elif "train" in snap.splits and n_tr == 0:
+            findings.append({"kind": "missing_in_train", "severity": CheckSeverity.WARNING,
+                             "class": name,
+                             "message": f"类别 {name!r} 在 val/test 出现 {n_va + n_te} 次"
+                                        f"但 train 为 0 — 模型无法学习,评估必然失真"})
+        elif "val" in snap.splits and n_tr > 0 and n_va == 0:
+            findings.append({"kind": "missing_in_val", "severity": CheckSeverity.WARNING,
+                             "class": name,
+                             "message": f"类别 {name!r} train 有 {n_tr} 但 val 为 0"
+                                        f" — 该类训练效果不可评估"})
+    if not findings:
+        return CheckResult(_NAME, CheckSeverity.PASS,
+                           f"{nc} 个类别在各划分均有出现", {"nc": nc})
+    severity = max((f["severity"] for f in findings), key=CheckSeverity.rank)
+    summary = next(f["message"] for f in findings if f["severity"] == severity)
+    return CheckResult(_NAME, severity, summary, {"findings": findings})
+```
+
+### 9.7 `checks/class_balance.py`
+
+长尾量化提醒，**只提醒、不开药方**（怎么处理是训练侧的决定）。
+
+```python
+# apps/platform/src/od_platform/data_validation/checks/class_balance.py
+"""check: class_balance —— 类别失衡(长尾)量化提醒。只提醒,不开药方。
+失衡比 = 最多类实例数/最少类实例数(只看非零类);≥50 WARNING / ≥10 INFO。"""
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from od_platform.common.constants import (
+    CLASS_IMBALANCE_INFO_RATIO, STATS_MAX_IMBALANCE_RATIO,
+)
+from od_platform.data_validation.registry import (
+    CheckContext, CheckResult, CheckSeverity, check,
+)
+
+_NAME = "class_balance"
+
+
+@check(_NAME)
+def validate_class_balance(ctx: CheckContext) -> CheckResult:
+    snap = ctx.snapshot
+    findings: List[Dict[str, Any]] = []
+    for split, st in snap.stats_per_split.items():
+        nonzero = {c: n for c, n in st.class_instances.items() if n > 0}
+        if len(nonzero) < 2:
+            continue
+        max_c = max(nonzero, key=nonzero.get)
+        min_c = min(nonzero, key=nonzero.get)
+        ratio = nonzero[max_c] / nonzero[min_c]
+        if ratio >= STATS_MAX_IMBALANCE_RATIO:
+            sev = CheckSeverity.WARNING
+        elif ratio >= CLASS_IMBALANCE_INFO_RATIO:
+            sev = CheckSeverity.INFO
+        else:
+            continue
+        findings.append({"split": split, "ratio": round(ratio, 1), "severity": sev,
+                         "message": f"{split} 失衡比 {ratio:.1f}x — 长尾提醒,"
+                                    f"训练时建议关注 class_weights / 重采样"})
+    if not findings:
+        return CheckResult(_NAME, CheckSeverity.PASS, "各类别实例数未见显著失衡", {})
+    severity = max((f["severity"] for f in findings), key=CheckSeverity.rank)
+    summary = next(f["message"] for f in findings if f["severity"] == severity)
+    return CheckResult(_NAME, severity, summary, {"findings": findings})
+```
+
+---
+
+## 10. 端到端验证
+
+```bash
+odp-validate configs/datasets/demo.yaml; echo "exit=$?"
+```
+
+demo 数据集的预期（真实运行输出）：15 项里 13 项 PASS，`split_presence` 为 INFO（val/test 各 6 张 < 30 的方差提示），`bbox_within_image` 为 **WARNING**——正是 D3 故意埋在 `c_050.xml` 里的越界框（xmax=700>640），在这里被抓到：
+
+```
+[PASS   ] yaml_schema: yaml 结构合法
+[PASS   ] pair_existence: 全部 63 张图均有标签
+[PASS   ] fingerprint_match: 契约指纹三方一致
+[PASS   ] manifest_lineage: 63 个样本逐条核验通过
+[PASS   ] label_format: 全部 75 行标签结构与取值合法
+[WARNING] bbox_within_image: 1/75 个框出界(1.3%)— 少量,建议修源数据
+...
+exit=1
+```
+
+契约对账验证（改一行内容 → ERROR，退出码 2）：
+
+```bash
+# 临时改一个标签文件(验证完用 odp-transform 重建恢复)
+echo "0 0.5 0.5 0.1 0.1" >> data/processed/demo/labels/train/c_000.txt
+odp-validate configs/datasets/demo.yaml --no-report; echo "exit=$?"
+# [ERROR  ] manifest_lineage: 契约核验失败: changed=1 ...   exit=2
+odp-transform --dataset demo --format pascal_voc --split-strategy stratified_multilabel  # 恢复
+```
+
+提交建议：`git add -A && git commit -m "D4.10: odp-validate 全链路(15 项 check)"`
+
+---
+
+## 11. 回归测试
+
+### 11.1 `conftest.py`：夹具（全部基于真实产物的拷贝）
+
+纪律：**夹具只动拷贝，绝不碰 `data/processed/demo` 原样**。每个"脏"夹具 = 把 D3 真实产出整体拷进临时目录 → 在拷贝上动手脚 → 写一份指向拷贝的 yaml（`odp_meta` 原样保留，契约依然有效，这样内容/位置类问题才能被独立抓出来）。
+
+```python
+# apps/platform/tests/conftest.py
+"""D4 测试夹具:全部基于 D3 真实产物的【拷贝】,绝不改 data/processed 原样。"""
+from pathlib import Path
+import shutil
+
+import pytest
+import yaml
+
+from od_platform.common import paths
+from od_platform.data_pipeline.orchestrator import DatasetPipeline
+
+
+def _ensure_demo_yaml() -> Path:
+    """确保 D3 已产出 demo;没跑过就现场跑一遍。"""
+    yaml_path = paths.dataset_yaml_path("demo")
+    if not yaml_path.exists():
+        DatasetPipeline("demo", "pascal_voc",
+                        split_strategy="stratified_multilabel").run()
+    return yaml_path
+
+
+@pytest.fixture(scope="session")
+def demo_yaml() -> Path:
+    return _ensure_demo_yaml()
+
+
+def _make_variant(tmp_path: Path, name: str, mutate=None, mutate_yaml=None) -> Path:
+    """拷贝 processed/demo 到 tmp_path/name,动手脚,写指向拷贝的 yaml(odp_meta 原样)。"""
+    src_yaml = _ensure_demo_yaml()
+    dst_root = tmp_path / name
+    shutil.copytree(paths.dataset_processed_dir("demo"), dst_root)
+    if mutate:
+        mutate(dst_root)
+    doc = yaml.safe_load(src_yaml.read_text(encoding="utf-8"))
+    doc["path"] = dst_root.as_posix()
+    if mutate_yaml:
+        mutate_yaml(doc)
+    yp = tmp_path / f"{name}.yaml"
+    yp.write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False),
+                  encoding="utf-8")
+    return yp
+
+
+def _first_label(root: Path, split: str) -> Path:
+    return sorted((root / "labels" / split).glob("*.txt"))[0]
+
+
+# ---- 上篇夹具 ----
+
+@pytest.fixture
+def demo_yaml_missing_labels(tmp_path) -> Path:
+    """删掉 train 里每 5 个标签中的 1 个(≈16% → WARNING)。"""
+    def mutate(root: Path):
+        for i, lbl in enumerate(sorted((root / "labels" / "train").glob("*.txt"))):
+            if i % 5 == 0:
+                lbl.unlink()
+    return _make_variant(tmp_path, "missing_labels", mutate)
+
+
+@pytest.fixture
+def demo_yaml_wrong_fingerprint(tmp_path) -> Path:
+    """yaml 指纹清零(张冠李戴)→ fingerprint_match ERROR。"""
+    return _make_variant(tmp_path, "wrong_fp",
+                         mutate_yaml=lambda doc: doc["odp_meta"].update(
+                             contract_fingerprint="0" * 64))
+
+
+@pytest.fixture
+def demo_yaml_tampered_label(tmp_path) -> Path:
+    """改动一个标签的内容 → manifest_lineage 抓 changed。"""
+    def mutate(root: Path):
+        lbl = _first_label(root, "train")
+        lbl.write_text(lbl.read_text(encoding="utf-8") + "1 0.50 0.50 0.20 0.20\n",
+                       encoding="utf-8")
+    return _make_variant(tmp_path, "tampered_label", mutate)
+
+
+# ---- 下篇夹具 ----
+
+@pytest.fixture
+def demo_yaml_bbox_overflow(tmp_path) -> Path:
+    """加一个出界框(右缘 1.08)→ bbox_within_image 抓(WARNING,占比 <10%)。"""
+    def mutate(root: Path):
+        lbl = _first_label(root, "train")
+        lbl.write_text(lbl.read_text(encoding="utf-8") + "0 0.93 0.50 0.30 0.20\n",
+                       encoding="utf-8")
+    return _make_variant(tmp_path, "bbox_overflow", mutate)
+
+
+@pytest.fixture
+def demo_yaml_bad_field_count(tmp_path) -> Path:
+    """一行只有 4 列 → label_format ERROR;bbox_within_image 跳过不重复报。"""
+    def mutate(root: Path):
+        lbl = _first_label(root, "train")
+        lbl.write_text(lbl.read_text(encoding="utf-8") + "0 0.5 0.5 0.2\n",
+                       encoding="utf-8")
+    return _make_variant(tmp_path, "bad_field_count", mutate)
+
+
+@pytest.fixture
+def demo_yaml_leaked_sample(tmp_path) -> Path:
+    """把一张 train 图复制进 val → split_uniqueness 硬 ERROR。"""
+    def mutate(root: Path):
+        img = sorted((root / "images" / "train").glob("*"))[0]
+        shutil.copy2(img, root / "images" / "val" / img.name)
+    return _make_variant(tmp_path, "leaked_sample", mutate)
+
+
+@pytest.fixture
+def demo_yaml_class_missing_train(tmp_path) -> Path:
+    """train 里删光 反光衣(class 1)、并保证 val 里有一条 → missing_in_train WARNING。"""
+    def mutate(root: Path):
+        for lbl in (root / "labels" / "train").glob("*.txt"):
+            kept = [l for l in lbl.read_text(encoding="utf-8").splitlines()
+                    if l.strip() and not l.startswith("1 ")]
+            lbl.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+        val_lbl = _first_label(root, "val")
+        val_lbl.write_text(val_lbl.read_text(encoding="utf-8") + "1 0.50 0.50 0.20 0.20\n",
+                           encoding="utf-8")
+    return _make_variant(tmp_path, "class_missing_train", mutate)
+
+
+@pytest.fixture
+def demo_yaml_degenerate_and_extreme(tmp_path) -> Path:
+    """w=0.0005 的框:既是退化框、也算极端宽高比 —— if-chain 只报 zero/tiny 一个。"""
+    def mutate(root: Path):
+        lbl = _first_label(root, "train")
+        lbl.write_text(lbl.read_text(encoding="utf-8") + "0 0.50 0.50 0.0005 0.20\n",
+                       encoding="utf-8")
+    return _make_variant(tmp_path, "degenerate_and_extreme", mutate)
+```
+
+### 11.2 `test_data_validation.py`（10 项）
+
+```python
+# apps/platform/tests/test_data_validation.py
+"""data_validation 回归测试:干净集 + 九类脏集,守住 15 项 check 的关键语义。"""
+from pathlib import Path
+
+from od_platform.data_validation.registry import CheckContext, CheckSeverity, get_check
+from od_platform.data_validation.service import run_all_checks, validate_dataset
+from od_platform.data_validation.snapshot import build_snapshot
+
+
+def _ctx(yaml_path: Path) -> CheckContext:
+    return CheckContext(yaml_path=yaml_path, snapshot=build_snapshot(yaml_path))
+
+
+def _run(yaml_path: Path, name: str):
+    return get_check(name).func(_ctx(yaml_path))
+
+
+def test_clean_dataset_all_pass(demo_yaml):
+    """干净集:除 D3 故意埋的 c_050 越界框(bbox_within_image WARNING)外,全部 PASS/INFO。"""
+    for r in run_all_checks(_ctx(demo_yaml)):
+        if r.name == "bbox_within_image":
+            assert r.severity == CheckSeverity.WARNING, r  # c_050 埋雷,留给 D4 抓
+        else:
+            assert r.severity in (CheckSeverity.PASS, CheckSeverity.INFO), \
+                f"{r.name}: {r.severity} {r.summary}"
+
+
+def test_pair_existence_flags_missing(demo_yaml_missing_labels):
+    r = _run(demo_yaml_missing_labels, "pair_existence")
+    assert r.severity == CheckSeverity.WARNING       # ≈16%:≥5% 且 <50%
+    assert r.details["missing"] > 0
+
+
+def test_fingerprint_match_flags_swapped_yaml(demo_yaml_wrong_fingerprint):
+    r = _run(demo_yaml_wrong_fingerprint, "fingerprint_match")
+    assert r.severity == CheckSeverity.ERROR         # yaml 指纹与 manifest 不一致
+
+
+def test_manifest_lineage_flags_tampered_label(demo_yaml_tampered_label):
+    r = _run(demo_yaml_tampered_label, "manifest_lineage")
+    assert r.severity == CheckSeverity.ERROR
+    assert r.details["n_changed"] >= 1
+
+
+def test_exit_code_blocks_on_error(demo_yaml_tampered_label):
+    """端到端:有 ERROR → overall=ERROR(CLI 退出码 2)。"""
+    report = validate_dataset(demo_yaml_tampered_label, write_report=False)
+    assert report.overall_severity == CheckSeverity.ERROR
+
+
+def test_bbox_within_image_flags_overflow(demo_yaml_bbox_overflow):
+    r = _run(demo_yaml_bbox_overflow, "bbox_within_image")
+    assert r.severity in (CheckSeverity.WARNING, CheckSeverity.ERROR)
+    assert r.details["n_out"] >= 1
+
+
+def test_label_format_and_bbox_do_not_double_report(demo_yaml_bad_field_count):
+    """结构错误行:label_format 报 ERROR;bbox 跳过它,不重复报(且不升级为 ERROR)。"""
+    lf = _run(demo_yaml_bad_field_count, "label_format")
+    assert lf.severity == CheckSeverity.ERROR
+    bbox = _run(demo_yaml_bad_field_count, "bbox_within_image")
+    assert bbox.severity != CheckSeverity.ERROR
+    assert bbox.details["skipped_structure_errors"] >= 1
+
+
+def test_split_uniqueness_hard_error_on_leak(demo_yaml_leaked_sample):
+    r = _run(demo_yaml_leaked_sample, "split_uniqueness")
+    assert r.severity == CheckSeverity.ERROR          # 泄漏没有分级,直接 ERROR
+
+
+def test_class_presence_flags_missing_in_train(demo_yaml_class_missing_train):
+    r = _run(demo_yaml_class_missing_train, "class_presence")
+    assert r.severity == CheckSeverity.WARNING
+    kinds = {f["kind"] for f in r.details["findings"]}
+    assert "missing_in_train" in kinds
+
+
+def test_box_geometry_one_kind_per_line(demo_yaml_degenerate_and_extreme):
+    """if-chain 优先级:一行只报一个问题 —— 报了退化,就不再重复报极端宽高比。"""
+    r = _run(demo_yaml_degenerate_and_extreme, "box_geometry")
+    assert r.severity == CheckSeverity.WARNING
+    assert r.details["issue_kinds"].get("extreme_aspect_ratio", 0) == 0
+    assert sum(r.details["issue_kinds"].values()) >= 1
+```
+
+```bash
+pytest apps/platform/tests/ -v
+# data_pipeline 7 项 + data_validation 10 项,全部通过
+```
+
+提交建议：`git add -A && git commit -m "D4.11: data_validation 回归测试(10 项)"`
+
+---
+
+## 12. 收尾速查
+
+### 12.1 15 项 check 总表
+
+| check | 查什么 | 分级 |
+|---|---|---|
+| `yaml_schema` | nc/names/path/split 字段结构 | 有问题 → ERROR |
+| `pair_existence` | 图→标签缺失比 | ≥50% ERROR / ≥5% WARNING / 有 → INFO |
+| `fingerprint_match` | 契约指纹三方一致 | 不一致 → ERROR |
+| `manifest_lineage` | 逐样本 sha256 + split 位置 | 有 changed/moved/missing → ERROR |
+| `label_format` | 行结构/类别范围/坐标区间 | 任何一行坏 → ERROR |
+| `bbox_within_image` | 框出界比（detect） | ≥10% ERROR / 有 → WARNING |
+| `box_geometry` | 退化框/极端宽高比（detect） | 有 → WARNING |
+| `duplicate_annotations` | 完全重复行 | 有 → WARNING |
+| `annotation_coverage` | 无标注图占比 | ≥30% WARNING / ≥5% INFO |
+| `orphan_labels` | 有标签没图 | ≥10% WARNING / 有 → INFO |
+| `stem_collision` | 同 split 同名多扩展名 | 有 → WARNING |
+| `split_presence` | 划分齐备与规模 | train 缺 ERROR / 余 WARNING·INFO |
+| `split_uniqueness` | 跨 split 泄漏 | 有 → ERROR（无分级） |
+| `class_presence` | 类别该在的划分都在吗 | 死类别 INFO / 缺 train·val WARNING |
+| `class_balance` | 长尾失衡比 | ≥50 WARNING / ≥10 INFO |
+
+### 12.2 关键约定
+
+| 约定 | 内容 |
+|---|---|
+| 质检只读 | 不改任何文件；修数据回源头，修完重跑 D3 |
+| 退出码 | ERROR→2 / WARNING→1 / PASS·INFO→0（取全场最严） |
+| 解析唯一权威 | `labels.py` 的 `parse_label_line`；判断归 check |
+| 结构错不重复报 | `label_format` 报过的行，几何类 check 跳过（details 里记 skipped 数） |
+| 快照分层 | 结构层 + SplitStats 有界聚合；逐框明细不设限、按需重读 |
+| 阈值进 constants | check 里不写魔法数 |
+| 契约不互信 | 只认 `common/lineage.py`；重算指纹 + 逐样本 sha256 对账 |
+| 单 check 崩溃 | service 唯一的宽 `except` 降级为 ERROR 结果，不拖垮整场 |
+
+### 12.3 常用排错
+
+| 症状 | 原因与处理 |
+|---|---|
+| `拿不到 D3 划分契约` | yaml 不是 `odp-transform` 产出，或 manifest 被删——重跑 D3 |
+| `manifest 自身指纹对不上` | manifest.json 被手改——重跑 D3 重出契约 |
+| `yaml 指纹与 manifest 不一致` | yaml 是从别的数据集拷来的（张冠李戴）——重跑 D3 |
+| csv 用 Excel 打开乱码 | 已用 `utf-8-sig`；若仍乱码，检查是不是自己重写过 csv |
+
+
+---
+
+# 【新增代码附录】D4_new_function
+
+原文档来源：D:\大三上实训\D4-数据验证（精简实操版）_#SULP#_1q3tka.md
+原文档已完整保留在上方，原文件未修改。
+
+新增：图片完整性检查、标签边界处理、SHA256 进度、质检报告历史对比及 Web 展示。原有类别 ID 与坐标归一化检查复用并加强。
+
+【标记约定】以下为在原代码基础上的新增/修正补丁。+ 开头表示新增代码，- 开头表示被替换的旧代码，空格开头为定位上下文。新建文件所有行均以 + 标明。
+【注释说明】各代码段前的说明标明功能归属；源码中的“新增”注释进一步解释关键处理。Ruff 自动整理的 import/格式调整也在补丁中如实记录。
+【当前行为】当前共 16 项质检；原讲义内数量和空图演示内容未改动。完整使用步骤及测试范围见 docs/data_engineering.md。
+
+## 【新增代码】apps/platform/src/od_platform/cli/validate_data.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/cli/validate_data.py
++++ 新增版本/apps/platform/src/od_platform/cli/validate_data.py
+@@ -1,41 +1,53 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : validate_data.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+ # @Function  : odp-validate 数据质检 CLI(只读)
+ """odp-validate:数据质检 CLI(只读,不改任何文件)。
+ 退出码:ERROR→2 / WARNING→1 / PASS·INFO→0。"""
++
+ from __future__ import annotations
+
+ import argparse
+ import sys
+ from pathlib import Path
+-from typing import List, Optional
+
+ from od_platform.common import paths
+ from od_platform.common.constants import Task
+ from od_platform.common.logging_utils import get_logger
++from od_platform.common.progress import ConsoleProgress
+ from od_platform.data_validation.registry import CheckSeverity
+ from od_platform.data_validation.service import validate_dataset
+
+-_EXIT_CODE = {CheckSeverity.ERROR: 2, CheckSeverity.WARNING: 1,
+-              CheckSeverity.INFO: 0, CheckSeverity.PASS: 0}
++_EXIT_CODE = {
++    CheckSeverity.ERROR: 2,
++    CheckSeverity.WARNING: 1,
++    CheckSeverity.INFO: 0,
++    CheckSeverity.PASS: 0,
++}
+
+ logger = get_logger(base_path=paths.LOGGING_DIR, log_type="validate")
+
+
+-def main(argv: Optional[List[str]] = None) -> int:
+-    p = argparse.ArgumentParser(prog="odp-validate",
+-                                description="数据集质检(只读):15 项 check,按最严聚合成退出码")
++def main(argv: list[str] | None = None) -> int:
++    p = argparse.ArgumentParser(
++        prog="odp-validate", description="数据集质检(只读):自动发现所有 check,按最严聚合成退出码"
++    )
+     p.add_argument("yaml_path", help="数据集 yaml(如 configs/datasets/demo.yaml)")
+-    p.add_argument("--task", default=None, choices=Task.all(),
+-                   help="不传则取 yaml 里 odp_meta.task")
++    p.add_argument(
++        "--task", default=None, choices=Task.all(), help="不传则取 yaml 里 odp_meta.task"
++    )
+     p.add_argument("--run-id", default=None)
+     p.add_argument("--no-report", action="store_true", help="不写 json/csv 报告")
++    p.add_argument("--no-progress", action="store_true", help="关闭进度条")
+     args = p.parse_args(argv)
+-    report = validate_dataset(Path(args.yaml_path), task_type=args.task,
+-                              run_id=args.run_id, write_report=not args.no_report)
++    report = validate_dataset(
++        Path(args.yaml_path),
++        task_type=args.task,
++        run_id=args.run_id,
++        write_report=not args.no_report,
++        progress=None if args.no_progress else ConsoleProgress(),
++    )
+     return _EXIT_CODE.get(report.overall_severity, 2)
+
+
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/labels.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/labels.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/labels.py
+@@ -1,5 +1,4 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : labels.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+@@ -7,9 +6,10 @@
+ """YOLO 标签行解析:全框架唯一权威。
+ 返回 (box, kind):box=(class_id, [coords]);kind=None 表示合法;box=None 时 kind 指明原因。
+ """
++
+ from __future__ import annotations
+
+-from typing import List, Optional, Tuple
++import math
+
+ from od_platform.common.constants import Task
+
+@@ -17,10 +17,10 @@
+ KIND_PARSE = "parse_error"
+ KIND_POLY_FEW = "polygon_too_few_points"
+
+-ParsedBox = Tuple[int, List[float]]
++ParsedBox = tuple[int, list[float]]
+
+
+-def parse_label_line(line: str, task_type: str) -> Tuple[Optional[ParsedBox], Optional[str]]:
++def parse_label_line(line: str, task_type: str) -> tuple[ParsedBox | None, str | None]:
+     """解析一行 YOLO 标签(调用方先 strip;空行返回 (None, None))。"""
+     parts = line.split()
+     if not parts:
+@@ -39,4 +39,7 @@
+         coords = [float(v) for v in parts[1:]]
+     except ValueError:
+         return None, KIND_PARSE
++    # 新增：NaN/Infinity 不能用普通区间比较识别，必须先明确拒绝。
++    if not all(math.isfinite(value) for value in coords):
++        return None, KIND_PARSE
+     return (class_id, coords), None
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/registry.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/registry.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/registry.py
+@@ -1,5 +1,4 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : registry.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+@@ -9,11 +8,13 @@
+ 严重度四级:ERROR(必须修)> WARNING(可训但建议修)> INFO(提示)> PASS(通过);
+ rank() 供聚合取"全场最严"。重复注册直接 ValueError —— 静默覆盖等于埋雷。
+ """
++
+ from __future__ import annotations
+
++from collections.abc import Callable
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Any, Callable, Dict, List
++from typing import Any
+
+ from od_platform.data_validation.snapshot import DatasetSnapshot
+
+@@ -35,8 +36,10 @@
+ class CheckResult:
+     name: str
+     severity: str
+-    summary: str                                     # 一句话结论(给人看)
+-    details: Dict[str, Any] = field(default_factory=dict)  # 结构化证据(给程序看)
++    summary: str  # 一句话结论(给人看)
++    details: dict[str, Any] = field(default_factory=dict)  # 结构化证据(给程序看)
++    # 新增：完整问题身份表，供历史对比使用；None 表示旧检查仅按检查项对比。
++    issues: list[dict[str, Any]] | None = None
+
+     @property
+     def passed(self) -> bool:
+@@ -46,6 +49,7 @@
+ @dataclass
+ class CheckContext:
+     """一次质检运行共享的上下文。"""
++
+     yaml_path: Path
+     snapshot: DatasetSnapshot
+
+@@ -59,17 +63,19 @@
+     func: CheckFunc
+
+
+-_REGISTRY: Dict[str, CheckEntry] = {}
++_REGISTRY: dict[str, CheckEntry] = {}
+ _LAZY_INITIALIZED = False
+
+
+ def check(name: str):
+     """装饰器:把函数注册为质检项。"""
++
+     def deco(func: CheckFunc) -> CheckFunc:
+         if name in _REGISTRY:
+             raise ValueError(f"质检项重复注册: {name!r}")
+         _REGISTRY[name] = CheckEntry(name=name, func=func)
+         return func
++
+     return deco
+
+
+@@ -79,20 +85,21 @@
+         return
+     from od_platform.common.registry_utils import import_submodules
+     from od_platform.data_validation import checks
++
+     import_submodules(checks)
+     _LAZY_INITIALIZED = True
+
+
+-def get_all_checks() -> List[CheckEntry]:
++def get_all_checks() -> list[CheckEntry]:
+     _lazy_init()
+     return [_REGISTRY[k] for k in sorted(_REGISTRY)]
+
+
+ def get_check(name: str) -> CheckEntry:
+     _lazy_init()
+-    return _REGISTRY[name]          # 名字写错就该炸(KeyError)
++    return _REGISTRY[name]  # 名字写错就该炸(KeyError)
+
+
+-def list_check_names() -> List[str]:
++def list_check_names() -> list[str]:
+     _lazy_init()
+     return sorted(_REGISTRY)
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/snapshot.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/snapshot.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/snapshot.py
+@@ -1,5 +1,4 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : snapshot.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+@@ -7,16 +6,17 @@
+ """数据集快照:把 yaml + 磁盘状态装进一个只读数据结构,供所有 check 共享。
+ 装数据的，不下结论 —— snapshot 只负责"如实呈现",判断是 check 的事。
+ """
++
+ from __future__ import annotations
+
+ import logging
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Dict, List, Optional, Tuple
+
+ import yaml
+
+ from od_platform.common.constants import IMAGE_EXTENSIONS, Task
++from od_platform.common.progress import track
+ from od_platform.data_validation.labels import parse_label_line
+
+ logger = logging.getLogger(__name__)
+@@ -27,30 +27,32 @@
+ @dataclass(frozen=True)
+ class SplitStats:
+     """单个 split 的有界聚合统计(内存占用与样本数无关)。"""
++
+     image_count: int = 0
+-    annotated_count: int = 0                        # 有 ≥1 个有效框的图数
+-    instance_count: int = 0                         # 有效框总数
+-    class_instances: Dict[int, int] = field(default_factory=dict)
++    annotated_count: int = 0  # 有 ≥1 个有效框的图数
++    instance_count: int = 0  # 有效框总数
++    class_instances: dict[int, int] = field(default_factory=dict)
+
+
+ @dataclass
+ class DatasetSnapshot:
+     """一次质检运行共享的数据集快照。"""
++
+     yaml_path: Path
+-    yaml_data: Dict = field(default_factory=dict)
+-    yaml_load_error: Optional[str] = None
+-    data_root: Optional[Path] = None
+-    nc: Optional[int] = None
+-    class_names: List[str] = field(default_factory=list)
++    yaml_data: dict = field(default_factory=dict)
++    yaml_load_error: str | None = None
++    data_root: Path | None = None
++    nc: int | None = None
++    class_names: list[str] = field(default_factory=list)
+     task_type: str = Task.DETECT
+-    images_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)
+-    labels_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)        # 期望存在
+-    label_files_per_split: Dict[str, Tuple[Path, ...]] = field(default_factory=dict)   # 磁盘实有
+-    stats_per_split: Dict[str, SplitStats] = field(default_factory=dict)
+-    scan_warnings: List[str] = field(default_factory=list)
++    images_per_split: dict[str, tuple[Path, ...]] = field(default_factory=dict)
++    labels_per_split: dict[str, tuple[Path, ...]] = field(default_factory=dict)  # 期望存在
++    label_files_per_split: dict[str, tuple[Path, ...]] = field(default_factory=dict)  # 磁盘实有
++    stats_per_split: dict[str, SplitStats] = field(default_factory=dict)
++    scan_warnings: list[str] = field(default_factory=list)
+
+     @property
+-    def splits(self) -> List[str]:
++    def splits(self) -> list[str]:
+         return sorted(self.images_per_split)
+
+     @property
+@@ -60,7 +62,8 @@
+
+ # ---------------------------------------------------------------- 内部装配
+
+-def _load_yaml(yaml_path: Path) -> Tuple[Dict, Optional[str]]:
++
++def _load_yaml(yaml_path: Path) -> tuple[dict, str | None]:
+     try:
+         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+     except Exception as e:
+@@ -70,7 +73,7 @@
+     return data, None
+
+
+-def _resolve_data_root(yaml_path: Path, data: Dict) -> Optional[Path]:
++def _resolve_data_root(yaml_path: Path, data: dict) -> Path | None:
+     raw = data.get("path")
+     if not raw:
+         return None
+@@ -78,7 +81,7 @@
+     return p if p.is_absolute() else (yaml_path.parent / p).resolve()
+
+
+-def _list_images(split_dir: Path) -> Tuple[Path, ...]:
++def _list_images(split_dir: Path) -> tuple[Path, ...]:
+     exts = {e.lower() for e in IMAGE_EXTENSIONS} | {e.upper() for e in IMAGE_EXTENSIONS}
+     return tuple(sorted(p for p in split_dir.iterdir() if p.suffix in exts))
+
+@@ -91,12 +94,12 @@
+     return Path(*parts).with_suffix(".txt")
+
+
+-def _list_label_files(data_root: Path, split: str) -> Tuple[Path, ...]:
++def _list_label_files(data_root: Path, split: str) -> tuple[Path, ...]:
+     d = data_root / "labels" / split
+     return tuple(sorted(d.glob("*.txt"))) if d.exists() else ()
+
+
+-def _normalize_names(names) -> List[str]:
++def _normalize_names(names) -> list[str]:
+     if isinstance(names, dict):
+         return [names[i] for i in sorted(names)]
+     if isinstance(names, list):
+@@ -109,13 +112,13 @@
+     nc = snap.nc
+     for split, label_paths in snap.labels_per_split.items():
+         n_annotated = n_inst = 0
+-        class_inst: Dict[int, int] = {}
+-        for lbl in label_paths:
++        class_inst: dict[int, int] = {}
++        for lbl in track(label_paths, f"snapshot:{split}"):
+             if not lbl.exists():
+                 continue
+             try:
+                 text = lbl.read_text(encoding="utf-8")
+-            except OSError:
++            except (OSError, UnicodeError):
+                 continue
+             n_valid = 0
+             for line in text.splitlines():
+@@ -136,16 +139,17 @@
+             image_count=len(snap.images_per_split.get(split, ())),
+             annotated_count=n_annotated,
+             instance_count=n_inst,
+-            class_instances=class_inst)
++            class_instances=class_inst,
++        )
+
+
+-def build_snapshot(yaml_path: Path, task_type: Optional[str] = None) -> DatasetSnapshot:
++def build_snapshot(yaml_path: Path, task_type: str | None = None) -> DatasetSnapshot:
+     yaml_path = Path(yaml_path)
+     snap = DatasetSnapshot(yaml_path=yaml_path)
+     data, err = _load_yaml(yaml_path)
+     snap.yaml_data, snap.yaml_load_error = data, err
+     if err:
+-        return snap                                     # yaml 都读不了,后续 check 各自早返回
++        return snap  # yaml 都读不了,后续 check 各自早返回
+
+     snap.data_root = _resolve_data_root(yaml_path, data)
+     nc = data.get("nc")
+@@ -155,8 +159,9 @@
+     odp_meta = data.get("odp_meta") or {}
+     resolved = task_type or odp_meta.get("task") or Task.DETECT
+     if task_type and odp_meta.get("task") and task_type != odp_meta["task"]:
+-        logger.warning("task_type=%s 与 yaml odp_meta.task=%s 不一致,以参数为准",
+-                       task_type, odp_meta["task"])
++        logger.warning(
++            "task_type=%s 与 yaml odp_meta.task=%s 不一致,以参数为准", task_type, odp_meta["task"]
++        )
+     snap.task_type = resolved
+
+     if snap.data_root is None or not snap.data_root.exists():
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/service.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/service.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/service.py
+@@ -1,5 +1,4 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : service.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+@@ -7,19 +6,26 @@
+ """质检服务层:跑全部 check 并聚合。
+ 唯一的 except Exception 护栏在这里:单 check 崩溃降级为 ERROR 结果,不拖垮整场质检。
+ """
++
+ from __future__ import annotations
+
+ import time
+ from datetime import datetime
+ from pathlib import Path
+-from typing import List, Optional
++from uuid import uuid4
+
+ from od_platform.common import paths, stamp
+ from od_platform.common.lineage import compute_data_fingerprint
++from od_platform.common.progress import ProgressCallback, emit_progress, progress_scope, track
+ from od_platform.data_validation import VALIDATOR_VERSION
+ from od_platform.data_validation.checks._lineage import load_manifest_from_yaml
++from od_platform.data_validation.history import compare_reports, report_history
+ from od_platform.data_validation.registry import (
+-    CheckContext, CheckEntry, CheckResult, CheckSeverity, get_all_checks,
++    CheckContext,
++    CheckEntry,
++    CheckResult,
++    CheckSeverity,
++    get_all_checks,
+ )
+ from od_platform.data_validation.report import ValidationReport
+ from od_platform.data_validation.snapshot import build_snapshot
+@@ -28,27 +34,57 @@
+ def _safe_run_one(entry: CheckEntry, ctx: CheckContext) -> CheckResult:
+     try:
+         return entry.func(ctx)
+-    except Exception as e:                          # noqa: BLE001 —— 护栏,必须宽
+-        return CheckResult(entry.name, CheckSeverity.ERROR,
+-                           f"check 自身崩溃: {type(e).__name__}: {e}",
+-                           {"exception": repr(e)})
++    except Exception as e:  # noqa: BLE001 —— 护栏,必须宽
++        return CheckResult(
++            entry.name,
++            CheckSeverity.ERROR,
++            f"check 自身崩溃: {type(e).__name__}: {e}",
++            {"exception": repr(e)},
++        )
+
+
+-def run_all_checks(ctx: CheckContext) -> List[CheckResult]:
+-    return [_safe_run_one(e, ctx) for e in get_all_checks()]
++def run_all_checks(ctx: CheckContext) -> list[CheckResult]:
++    return [_safe_run_one(e, ctx) for e in track(get_all_checks(), "checks")]
+
+
+-def validate_dataset(yaml_path, task_type: Optional[str] = None,
+-                     run_id: Optional[str] = None,
+-                     write_report: bool = True) -> ValidationReport:
++def validate_dataset(
++    yaml_path,
++    task_type: str | None = None,
++    run_id: str | None = None,
++    write_report: bool = True,
++    progress: ProgressCallback | None = None,
++) -> ValidationReport:
++    # 新增：统一回调作用域，兼容原有调用方；Web 与终端共享进度事件。
++    with progress_scope(progress):
++        emit_progress("snapshot")
++        report = _validate_dataset(yaml_path, task_type, run_id, write_report)
++        emit_progress("complete", 1, 1)
++        return report
++
++
++def _validate_dataset(yaml_path, task_type, run_id, write_report) -> ValidationReport:
+     """端到端:快照 → 全量 check → 报告(logger + json/csv)。"""
+     t0 = time.perf_counter()
+-    run_id = run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
+-    yaml_path = Path(yaml_path)
++    run_id = run_id or datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:8]
++    if (
++        not run_id
++        or Path(run_id).name != run_id
++        or "/" in run_id
++        or "\\" in run_id
++        or run_id.startswith(".")
++    ):
++        raise ValueError("run_id 必须是单个目录名")
++    yaml_path = Path(yaml_path).resolve()
++    if write_report and (paths.validation_run_dir(run_id) / "report.json").exists():
++        raise ValueError(f"质检运行 {run_id} 已存在，请使用新的 run_id")
+     snapshot = build_snapshot(yaml_path, task_type=task_type)
+     results = run_all_checks(CheckContext(yaml_path=yaml_path, snapshot=snapshot))
+-    report = ValidationReport(run_id=run_id, snapshot=snapshot, results=results,
+-                              duration_seconds=time.perf_counter() - t0)
++    report = ValidationReport(
++        run_id=run_id, snapshot=snapshot, results=results, duration_seconds=time.perf_counter() - t0
++    )
++    previous = report_history(yaml_path, snapshot.task_type)
++    report.comparison = compare_reports(report.to_dict(), previous[0] if previous else None)
++    emit_progress("report")
+     report.render_to_logger()
+     if write_report:
+         out_dir = paths.validation_run_dir(run_id)
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/report.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/report.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/report.py
+@@ -1,10 +1,10 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : report.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+ # @Function  : 质检报告(纯数据 + logger/json/csv 三出口)
+ """质检报告:纯数据 + 三种出口(logger / json / csv)。报告不含判断逻辑。"""
++
+ from __future__ import annotations
+
+ import csv
+@@ -12,7 +12,7 @@
+ import logging
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Any, Dict, List
++from typing import Any
+
+ from od_platform.data_validation.registry import CheckResult, CheckSeverity
+
+@@ -22,9 +22,10 @@
+ @dataclass
+ class ValidationReport:
+     run_id: str
+-    snapshot: Any                                    # DatasetSnapshot(避免循环 import)
+-    results: List[CheckResult] = field(default_factory=list)
++    snapshot: Any  # DatasetSnapshot(避免循环 import)
++    results: list[CheckResult] = field(default_factory=list)
+     duration_seconds: float = 0.0
++    comparison: dict[str, Any] = field(default_factory=dict)  # 新增：本次与上次对比
+
+     @property
+     def overall_severity(self) -> str:
+@@ -33,23 +34,34 @@
+             return CheckSeverity.PASS
+         return max((r.severity for r in self.results), key=CheckSeverity.rank)
+
+-    def to_dict(self) -> Dict[str, Any]:
++    def to_dict(self) -> dict[str, Any]:
+         return {
+             "run_id": self.run_id,
+             "yaml_path": str(self.snapshot.yaml_path),
++            "task_type": self.snapshot.task_type,
++            "comparison": self.comparison,
+             "overall_severity": self.overall_severity,
+             "duration_seconds": round(self.duration_seconds, 3),
+             "results": [
+-                {"name": r.name, "severity": r.severity,
+-                 "summary": r.summary, "details": r.details}
++                {
++                    "name": r.name,
++                    "severity": r.severity,
++                    "summary": r.summary,
++                    "details": r.details,
++                    "issues": r.issues,
++                }
+                 for r in self.results
+             ],
+         }
+
+     def write_json(self, path: Path) -> None:
+         path.parent.mkdir(parents=True, exist_ok=True)
+-        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+-                        encoding="utf-8")
++        # 新增：原子替换，历史读取者不会看到半份 JSON。
++        temporary = path.with_suffix(".json.tmp")
++        temporary.write_text(
++            json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
++        )
++        temporary.replace(path)
+
+     def write_results_csv(self, path: Path) -> None:
+         """utf-8-sig 带 BOM:Excel 直接打开中文不乱码。"""
+@@ -63,8 +75,12 @@
+     def render_to_logger(self, log=None) -> None:
+         log = log or logger
+         log.info("=" * 60)
+-        log.info("数据质检报告 run_id=%s  总评: %s(%.2fs)",
+-                 self.run_id, self.overall_severity, self.duration_seconds)
++        log.info(
++            "数据质检报告 run_id=%s  总评: %s(%.2fs)",
++            self.run_id,
++            self.overall_severity,
++            self.duration_seconds,
++        )
+         log.info("=" * 60)
+         for r in self.results:
+             log.info("[%-7s] %s: %s", r.severity, r.name, r.summary)
+@@ -72,6 +88,9 @@
+         if fp and fp.details.get("fingerprint"):
+             log.info("-" * 60)
+             log.info("契约指纹: %s", fp.details["fingerprint"])
+-            log.info("样本数: %s  策略: %s  种子: %s",
+-                     fp.details.get("n_samples"), fp.details.get("strategy"),
+-                     fp.details.get("seed"))
++            log.info(
++                "样本数: %s  策略: %s  种子: %s",
++                fp.details.get("n_samples"),
++                fp.details.get("strategy"),
++                fp.details.get("seed"),
++            )
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/history.py
+
+注释：新增文件：完整新增代码。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/history.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/history.py
+@@ -0,0 +1,119 @@
++"""新增：同一 YAML、同一任务的历史对比，精确问题不受预览条数限制。"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++from od_platform.common import paths
++
++
++def report_history(yaml_path: Path, task_type: str | None = None) -> list[dict]:
++    reports = []
++    for report_path in paths.VALIDATION_RUNS_DIR.glob("*/report.json"):
++        try:
++            payload = json.loads(report_path.read_text(encoding="utf-8"))
++            if (
++                not isinstance(payload, dict)
++                or not isinstance(payload.get("run_id"), str)
++                or not isinstance(payload.get("results"), list)
++                or any(
++                    not isinstance(r, dict) or not {"name", "severity", "summary"} <= r.keys()
++                    for r in payload["results"]
++                )
++            ):
++                continue
++            if Path(payload.get("yaml_path", "")).resolve() != Path(yaml_path).resolve():
++                continue
++            if task_type and payload.get("task_type", "detect") != task_type:
++                continue
++            reports.append((report_path.stat().st_mtime_ns, report_path.parent.name, payload))
++        except (OSError, ValueError, TypeError):
++            continue  # 中断写入或损坏的旧报告不影响本次质检。
++    return [item[2] for item in sorted(reports, key=lambda item: item[:2], reverse=True)]
++
++
++def _issues(result: dict) -> dict[str, dict]:
++    check = result["name"]
++    if result.get("issues") is not None:
++        values = result["issues"]
++    elif result["severity"] in {"WARNING", "ERROR"}:
++        # 旧检查没有逐样本问题表时，按检查项跟踪，并在页面明确标识粒度。
++        values = [{"kind": "check_failed", "message": result["summary"], "scope": "check"}]
++    else:
++        values = []
++    return {
++        json.dumps(
++            [check, issue.get("split"), issue.get("file"), issue.get("line_no"), issue.get("kind")],
++            ensure_ascii=False,
++        ): {**issue, "check": check}
++        for issue in values
++    }
++
++
++def compare_reports(current: dict, previous: dict | None) -> dict:
++    """新增/修复仅比较两次都真正执行的检查；跳过或崩溃不能冒充修复。"""
++    if previous is None:
++        return {
++            "baseline_run_id": None,
++            "new": [],
++            "resolved": [],
++            "persistent_count": 0,
++            "severity_changes": [],
++            "message": "首次质检，已建立历史基线",
++        }
++    old = {r["name"]: r for r in previous["results"]}
++    # 本次读不出的标签不能据此宣布之前的行问题已修复（包括几何检查）。
++    unreadable = {
++        (issue.get("split"), issue.get("file"))
++        for result in current["results"]
++        for issue in result.get("issues") or []
++        if issue.get("kind") == "read_error"
++    }
++    new, resolved, severity_changes = [], [], []
++    persistent = 0
++    for result in current["results"]:
++        before = old.get(result["name"])
++        if before is None:
++            new.extend(_issues(result).values())
++            continue
++        if any(
++            r.get("details", {}).get("exception") or r.get("details", {}).get("reason")
++            for r in (result, before)
++        ):
++            continue
++        # 新旧版本若采用不同粒度，重新建立该检查的基线，避免假报新增/修复。
++        if (result.get("issues") is None) != (before.get("issues") is None):
++            if result["severity"] != before["severity"]:
++                severity_changes.append(
++                    {
++                        "check": result["name"],
++                        "before": before["severity"],
++                        "after": result["severity"],
++                    }
++                )
++            continue
++        earlier, now = _issues(before), _issues(result)
++        new.extend(now[k] for k in now.keys() - earlier.keys())
++        resolved.extend(
++            earlier[k]
++            for k in earlier.keys() - now.keys()
++            if (earlier[k].get("split"), earlier[k].get("file")) not in unreadable
++        )
++        persistent += len(now.keys() & earlier.keys())
++        if result["severity"] != before["severity"]:
++            severity_changes.append(
++                {"check": result["name"], "before": before["severity"], "after": result["severity"]}
++            )
++
++    def order(issue):
++        return json.dumps(issue, sort_keys=True, ensure_ascii=False)
++
++    return {
++        "baseline_run_id": previous["run_id"],
++        "new": sorted(new, key=order),
++        "resolved": sorted(resolved, key=order),
++        "persistent_count": persistent,
++        "severity_changes": severity_changes,
++        "message": "与上一次同数据集质检对比",
++    }
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/checks/image_integrity.py
+
+注释：新增文件：完整新增代码。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/checks/image_integrity.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/checks/image_integrity.py
+@@ -0,0 +1,40 @@
++"""新增：逐张校验图片容器及像素解码，识别空文件、截断文件和损坏图片。"""
++
++from __future__ import annotations
++
++from PIL import Image
++
++from od_platform.common.constants import DETAILS_PREVIEW_LIMIT
++from od_platform.common.progress import track
++from od_platform.data_validation.registry import CheckContext, CheckResult, CheckSeverity, check
++
++
++@check("image_integrity")
++def validate_image_integrity(ctx: CheckContext) -> CheckResult:
++    snap = ctx.snapshot
++    issues = []
++    items = [(split, image) for split in snap.splits for image in snap.images_per_split[split]]
++    for split, image in track(items, "image_integrity"):
++        try:
++            with Image.open(image) as decoded:
++                decoded.verify()
++            # verify 只验证容器，重新打开并 load 才能验证像素是否可解码。
++            with Image.open(image) as decoded:
++                decoded.load()
++        except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
++            issues.append(
++                {"split": split, "file": image.name, "kind": "decode_error", "message": str(exc)}
++            )
++    return CheckResult(
++        "image_integrity",
++        CheckSeverity.ERROR if issues else CheckSeverity.PASS,
++        f"{len(issues)}/{len(items)} 张图片无法完整解码"
++        if issues
++        else f"全部 {len(items)} 张图片可完整解码",
++        {
++            "total_images": len(items),
++            "n_bad": len(issues),
++            "bad_images_preview": issues[:DETAILS_PREVIEW_LIMIT],
++        },
++        issues=issues,
++    )
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/checks/label_format.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/checks/label_format.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/checks/label_format.py
+@@ -1,18 +1,20 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : label_format.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+ # @Function  : check: label_format
+ """check: label_format —— 每行标签的结构与取值合法吗。任何一行坏 → ERROR。"""
++
+ from __future__ import annotations
+
+-from typing import Dict, List, Optional, Tuple
+-
+ from od_platform.common.constants import DETAILS_PREVIEW_LIMIT
++from od_platform.common.progress import track
+ from od_platform.data_validation.labels import ParsedBox, parse_label_line
+ from od_platform.data_validation.registry import (
+-    CheckContext, CheckResult, CheckSeverity, check,
++    CheckContext,
++    CheckResult,
++    CheckSeverity,
++    check,
+ )
+
+ _NAME = "label_format"
+@@ -20,8 +22,7 @@
+ KIND_COORD_OUT_OF_RANGE = "coord_out_of_range"
+
+
+-def _validate_one_line(line: str, task_type: str,
+-                       nc: int) -> Tuple[Optional[ParsedBox], Optional[str]]:
++def _validate_one_line(line: str, task_type: str, nc: int) -> tuple[ParsedBox | None, str | None]:
+     """纯函数:(box, kind);kind=None 即合法。"""
+     box, kind = parse_label_line(line, task_type)
+     if box is None:
+@@ -31,6 +32,8 @@
+         return None, KIND_CLASS_ID_OUT_OF_RANGE
+     if any(v < 0 or v > 1 for v in coords):
+         return None, KIND_COORD_OUT_OF_RANGE
++    if task_type == "detect" and (coords[2] <= 0 or coords[3] <= 0):
++        return None, "non_positive_box_size"
+     return box, None
+
+
+@@ -39,16 +42,26 @@
+     snap = ctx.snapshot
+     nc = snap.nc
+     if not isinstance(nc, int):
+-        return CheckResult(_NAME, CheckSeverity.PASS,
+-                           "nc 不可用,跳过(见 yaml_schema)", {"reason": "nc_unavailable"})
+-    bad_lines: List[dict] = []
+-    error_kinds: Dict[str, int] = {}
++        return CheckResult(
++            _NAME,
++            CheckSeverity.PASS,
++            "nc 不可用,跳过(见 yaml_schema)",
++            {"reason": "nc_unavailable"},
++        )
++    bad_lines: list[dict] = []
++    issues = []  # 新增：完整历史问题表，与有界预览分开存储。
++    error_kinds: dict[str, int] = {}
+     n_bad = n_total = 0
+     for split in snap.splits:
+-        for lbl in snap.label_files_per_split[split]:
++        for lbl in track(snap.label_files_per_split[split], f"label_format:{split}"):
+             try:
+                 text = lbl.read_text(encoding="utf-8")
+-            except OSError:
++            except (OSError, UnicodeError) as exc:
++                n_bad += 1
++                error_kinds["read_error"] = error_kinds.get("read_error", 0) + 1
++                issues.append(
++                    {"split": split, "file": lbl.name, "kind": "read_error", "message": str(exc)}
++                )
+                 continue
+             for line_no, line in enumerate(text.splitlines(), 1):
+                 line = line.strip()
+@@ -59,14 +72,42 @@
+                 if kind is not None:
+                     n_bad += 1
+                     error_kinds[kind] = error_kinds.get(kind, 0) + 1
++                    issues.append(
++                        {
++                            "split": split,
++                            "file": lbl.name,
++                            "line_no": line_no,
++                            "kind": kind,
++                            "message": line,
++                        }
++                    )
+                     if len(bad_lines) < DETAILS_PREVIEW_LIMIT:
+-                        bad_lines.append({"split": split, "label": str(lbl),
+-                                          "line_no": line_no, "kind": kind,
+-                                          "line": line})
++                        bad_lines.append(
++                            {
++                                "split": split,
++                                "label": str(lbl),
++                                "line_no": line_no,
++                                "kind": kind,
++                                "line": line,
++                            }
++                        )
+     if n_bad == 0:
+-        return CheckResult(_NAME, CheckSeverity.PASS,
+-                           f"全部 {n_total} 行标签结构与取值合法", {"total_lines": n_total})
+-    return CheckResult(_NAME, CheckSeverity.ERROR,
+-                       f"{n_bad}/{n_total} 行标签非法({error_kinds})",
+-                       {"total_lines": n_total, "n_bad": n_bad,
+-                        "error_kinds": error_kinds, "bad_lines_preview": bad_lines})
++        return CheckResult(
++            _NAME,
++            CheckSeverity.PASS,
++            f"全部 {n_total} 行标签结构与取值合法",
++            {"total_lines": n_total},
++            issues=[],
++        )
++    return CheckResult(
++        _NAME,
++        CheckSeverity.ERROR,
++        f"{n_bad}/{n_total} 行标签非法({error_kinds})",
++        {
++            "total_lines": n_total,
++            "n_bad": n_bad,
++            "error_kinds": error_kinds,
++            "bad_lines_preview": bad_lines,
++        },
++        issues=issues,
++    )
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/checks/bbox_within_image.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/checks/bbox_within_image.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/checks/bbox_within_image.py
+@@ -1,31 +1,35 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : bbox_within_image.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+ # @Function  : check: bbox_within_image
+ """check: bbox_within_image —— 框相对图像出不出界(cx±w/2 合并判断)。
+ ≥10% 出界 → ERROR;有但 <10% → WARNING。结构错误的行跳过(label_format 已报)。"""
++
+ from __future__ import annotations
+
+-from typing import List
+-
+ from od_platform.common.constants import (
+-    BBOX_EDGE_TOLERANCE, BBOX_OUT_ERROR_RATIO, DETAILS_PREVIEW_LIMIT, Task,
++    BBOX_EDGE_TOLERANCE,
++    BBOX_OUT_ERROR_RATIO,
++    DETAILS_PREVIEW_LIMIT,
++    Task,
+ )
++from od_platform.common.progress import track
+ from od_platform.data_validation.labels import parse_label_line
+ from od_platform.data_validation.registry import (
+-    CheckContext, CheckResult, CheckSeverity, check,
++    CheckContext,
++    CheckResult,
++    CheckSeverity,
++    check,
+ )
+
+ _NAME = "bbox_within_image"
+
+
+-def _overflow_amount(coords: List[float]) -> float:
++def _overflow_amount(coords: list[float]) -> float:
+     """cx,cy,w,h → 出界量(不出界为 0;容差 BBOX_EDGE_TOLERANCE)。"""
+     cx, cy, w, h = coords
+-    overflow = max(0 - (cx - w / 2), (cx + w / 2) - 1,
+-                   0 - (cy - h / 2), (cy + h / 2) - 1)
++    overflow = max(0 - (cx - w / 2), (cx + w / 2) - 1, 0 - (cy - h / 2), (cy + h / 2) - 1)
+     return max(0.0, overflow - BBOX_EDGE_TOLERANCE)
+
+
+@@ -33,16 +37,20 @@
+ def validate_bbox_within_image(ctx: CheckContext) -> CheckResult:
+     snap = ctx.snapshot
+     if snap.task_type == Task.SEGMENT:
+-        return CheckResult(_NAME, CheckSeverity.PASS,
+-                           "task=segment,出界检查仅适用 detect(多边形顶点允许在外)",
+-                           {"reason": "task_not_applicable"})
+-    out_boxes: List[dict] = []
++        return CheckResult(
++            _NAME,
++            CheckSeverity.PASS,
++            "task=segment,出界检查仅适用 detect(多边形顶点允许在外)",
++            {"reason": "task_not_applicable"},
++        )
++    out_boxes: list[dict] = []
++    issues = []  # 新增：全量问题身份用于历史对比。
+     n_out = n_total = n_skipped = 0
+     for split in snap.splits:
+-        for lbl in snap.label_files_per_split[split]:
++        for lbl in track(snap.label_files_per_split[split], f"bbox_within_image:{split}"):
+             try:
+                 text = lbl.read_text(encoding="utf-8")
+-            except OSError:
++            except (OSError, UnicodeError):
+                 continue
+             for line_no, line in enumerate(text.splitlines(), 1):
+                 line = line.strip()
+@@ -50,28 +58,56 @@
+                     continue
+                 box, kind = parse_label_line(line, snap.task_type)
+                 if box is None:
+-                    n_skipped += 1                     # 结构错误:label_format 已报,跳过
++                    n_skipped += 1  # 结构错误:label_format 已报,跳过
+                     continue
+                 n_total += 1
+                 if _overflow_amount(box[1]) > 0:
+                     n_out += 1
++                    issues.append(
++                        {
++                            "split": split,
++                            "file": lbl.name,
++                            "line_no": line_no,
++                            "kind": "bbox_overflow",
++                            "message": str(box[1]),
++                        }
++                    )
+                     if len(out_boxes) < DETAILS_PREVIEW_LIMIT:
+-                        out_boxes.append({"split": split, "label": str(lbl),
+-                                          "line_no": line_no, "coords": box[1]})
+-    details = {"total_boxes": n_total, "n_out": n_out,
+-               "out_ratio": round(n_out / n_total, 4) if n_total else 0.0,
+-               "skipped_structure_errors": n_skipped,
+-               "thresholds": {"error_ratio": BBOX_OUT_ERROR_RATIO,
+-                              "edge_tolerance": BBOX_EDGE_TOLERANCE},
+-               "out_boxes_preview": out_boxes}
++                        out_boxes.append(
++                            {
++                                "split": split,
++                                "label": str(lbl),
++                                "line_no": line_no,
++                                "coords": box[1],
++                            }
++                        )
++    details = {
++        "total_boxes": n_total,
++        "n_out": n_out,
++        "out_ratio": round(n_out / n_total, 4) if n_total else 0.0,
++        "skipped_structure_errors": n_skipped,
++        "thresholds": {"error_ratio": BBOX_OUT_ERROR_RATIO, "edge_tolerance": BBOX_EDGE_TOLERANCE},
++        "out_boxes_preview": out_boxes,
++    }
+     if n_total == 0:
+-        return CheckResult(_NAME, CheckSeverity.PASS, "没有可检查的框", details)
++        return CheckResult(_NAME, CheckSeverity.PASS, "没有可检查的框", details, issues=issues)
+     ratio = n_out / n_total
+     if ratio >= BBOX_OUT_ERROR_RATIO:
+-        return CheckResult(_NAME, CheckSeverity.ERROR,
+-                           f"{n_out}/{n_total} 个框出界({ratio:.1%})", details)
++        return CheckResult(
++            _NAME,
++            CheckSeverity.ERROR,
++            f"{n_out}/{n_total} 个框出界({ratio:.1%})",
++            details,
++            issues=issues,
++        )
+     if n_out:
+-        return CheckResult(_NAME, CheckSeverity.WARNING,
+-                           f"{n_out}/{n_total} 个框出界({ratio:.1%})— 少量,建议修源数据",
+-                           details)
+-    return CheckResult(_NAME, CheckSeverity.PASS, f"全部 {n_total} 个框均在图像内", details)
++        return CheckResult(
++            _NAME,
++            CheckSeverity.WARNING,
++            f"{n_out}/{n_total} 个框出界({ratio:.1%})— 少量,建议修源数据",
++            details,
++            issues=issues,
++        )
++    return CheckResult(
++        _NAME, CheckSeverity.PASS, f"全部 {n_total} 个框均在图像内", details, issues=issues
++    )
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/data_validation/checks/manifest_lineage.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/data_validation/checks/manifest_lineage.py
++++ 新增版本/apps/platform/src/od_platform/data_validation/checks/manifest_lineage.py
+@@ -1,21 +1,24 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : manifest_lineage.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+ # @Function  : check: manifest_lineage
+ """check: manifest_lineage —— 逐样本核验:在契约说的 split 里、内容 sha256 没变。
+ changed(内容变了)/ moved(split 挪了)/ missing(丢了)分开计数。"""
++
+ from __future__ import annotations
+
+ import hashlib
+ from pathlib import Path
+-from typing import Dict, List, Tuple
+
+ from od_platform.common.constants import LINEAGE_MAX_DETAIL
++from od_platform.common.progress import track
+ from od_platform.data_validation.checks._lineage import load_manifest_from_yaml
+ from od_platform.data_validation.registry import (
+-    CheckContext, CheckResult, CheckSeverity, check,
++    CheckContext,
++    CheckResult,
++    CheckSeverity,
++    check,
+ )
+
+ _NAME = "manifest_lineage"
+@@ -33,37 +36,60 @@
+     snap = ctx.snapshot
+
+     # 磁盘实况:(split, stem) → 标签路径;stem → 实际出现的 split 集合
+-    disk: Dict[Tuple[str, str], Path] = {}
+-    disk_splits_of_stem: Dict[str, set] = {}
++    disk: dict[tuple[str, str], Path] = {}
++    disk_splits_of_stem: dict[str, set] = {}
+     for split in snap.splits:
+         for lbl in snap.label_files_per_split[split]:
+             disk[(split, lbl.stem)] = lbl
+             disk_splits_of_stem.setdefault(lbl.stem, set()).add(split)
+
+-    changed: List[str] = []
+-    moved: List[dict] = []
+-    missing: List[str] = []
+-    for s in manifest.samples:
++    changed: list[str] = []
++    moved: list[dict] = []
++    missing: list[str] = []
++    issues = []  # 新增：记录每个契约异常，历史比较不会被 preview 截断。
++    for s in track(manifest.samples, "manifest_lineage"):
+         lbl = disk.get((s.split, s.stem))
+         if lbl is None:
+             elsewhere = disk_splits_of_stem.get(s.stem)
+             if elsewhere:
+                 moved.append({"stem": s.stem, "expect": s.split, "actual": sorted(elsewhere)})
++                issues.append(
++                    {
++                        "split": s.split,
++                        "file": s.stem,
++                        "kind": "moved",
++                        "message": f"实际划分: {sorted(elsewhere)}",
++                    }
++                )
+             else:
+                 missing.append(s.stem)
++                issues.append({"split": s.split, "file": s.stem, "kind": "missing"})
+         elif _sha256(lbl) != s.sha256:
+             changed.append(s.stem)
++            issues.append({"split": s.split, "file": s.stem, "kind": "changed"})
+
+-    details = {"n_samples": len(manifest.samples),
+-               "n_changed": len(changed), "n_moved": len(moved), "n_missing": len(missing),
+-               "changed_preview": changed[:LINEAGE_MAX_DETAIL],
+-               "moved_preview": moved[:LINEAGE_MAX_DETAIL],
+-               "missing_preview": missing[:LINEAGE_MAX_DETAIL]}
++    details = {
++        "n_samples": len(manifest.samples),
++        "n_changed": len(changed),
++        "n_moved": len(moved),
++        "n_missing": len(missing),
++        "changed_preview": changed[:LINEAGE_MAX_DETAIL],
++        "moved_preview": moved[:LINEAGE_MAX_DETAIL],
++        "missing_preview": missing[:LINEAGE_MAX_DETAIL],
++    }
+     if changed or moved or missing:
+         return CheckResult(
+-            _NAME, CheckSeverity.ERROR,
++            _NAME,
++            CheckSeverity.ERROR,
+             f"契约核验失败: changed={len(changed)} moved={len(moved)} missing={len(missing)}"
+             f" —— 与 D3 产出不一致,重跑 odp-transform 或查谁动了 processed",
+-            details)
+-    return CheckResult(_NAME, CheckSeverity.PASS,
+-                       f"{len(manifest.samples)} 个样本逐条核验通过", details)
++            details,
++            issues=issues,
++        )
++    return CheckResult(
++        _NAME,
++        CheckSeverity.PASS,
++        f"{len(manifest.samples)} 个样本逐条核验通过",
++        details,
++        issues=issues,
++    )
+
+```
+
+## 【新增代码】apps/platform/tests/conftest.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。
+
+```diff
+--- 原版本/apps/platform/tests/conftest.py
++++ 新增版本/apps/platform/tests/conftest.py
+@@ -1,27 +1,57 @@
+ #!/usr/bin/env python
+-# -*- coding:utf-8 -*-
+ # @FileName  : conftest.py
+ # @Author    : ODPlatform Team
+ # @Project   : ODPlatform
+ # @Function  : D4 测试夹具
+ """D4 测试夹具:全部基于 D3 真实产物的【拷贝】,绝不改 data/processed 原样。"""
++
++import runpy
++import shutil
+ from pathlib import Path
+-import shutil
+
+ import pytest
+ import yaml
++from PIL import Image
+
+-from od_platform.common import paths
++from od_platform.common import paths, stamp
+ from od_platform.data_pipeline.orchestrator import DatasetPipeline
++
++_DEMO_YAML = None
++
++
++@pytest.fixture(scope="session", autouse=True)
++def isolated_demo_workspace(tmp_path_factory):
++    """新增：在临时工作区生成真实可解码的演示集，不依赖本机原始数据。"""
++    global _DEMO_YAML
++    root = tmp_path_factory.mktemp("data_demo")
++    with pytest.MonkeyPatch.context() as patch:
++        patch.setattr(paths, "ROOT_DIR", root)
++        patch.setattr(paths, "RAW_DATA_DIR", root / "data" / "raw")
++        patch.setattr(paths, "PROCESSED_DATA_DIR", root / "data" / "processed")
++        patch.setattr(paths, "RUNS_DIR", root / "runs")
++        patch.setattr(paths, "DATASET_CONFIGS_DIR", root / "configs")
++        patch.setattr(stamp, "LINEAGE_DIR", root / "runs" / "lineage")
++        runpy.run_path(str(paths.SCRIPTS_DIR / "demo_data" / "make_demo.py"))
++        for image in paths.raw_dataset_root("demo").joinpath("images").glob("*.jpg"):
++            Image.new("RGB", (640, 480), (40, 80, 120)).save(image)
++        result = DatasetPipeline("demo", "pascal_voc", split_strategy="stratified_multilabel").run()
++        _DEMO_YAML = Path(result["yaml"])
++        data = yaml.safe_load(_DEMO_YAML.read_text(encoding="utf-8"))
++        # 新增：离开路径补丁后，契约仍能通过绝对引用在临时目录内找到。
++        data["odp_meta"]["manifest_path"] = result["manifest_path"]
++        _DEMO_YAML.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
++    yield
++
++
++@pytest.fixture(autouse=True)
++def isolated_test_stamps(tmp_path, monkeypatch):
++    """新增：测试中的数据流转章同样写临时目录。"""
++    monkeypatch.setattr(stamp, "LINEAGE_DIR", tmp_path / "lineage")
+
+
+ def _ensure_demo_yaml() -> Path:
+     """确保 D3 已产出 demo;没跑过就现场跑一遍。"""
+-    yaml_path = paths.dataset_yaml_path("demo")
+-    if not yaml_path.exists():
+-        DatasetPipeline("demo", "pascal_voc",
+-                        split_strategy="stratified_multilabel").run()
+-    return yaml_path
++    return _DEMO_YAML
+
+
+ @pytest.fixture(scope="session")
+@@ -33,7 +63,8 @@
+     """拷贝 processed/demo 到 tmp_path/name,动手脚,写指向拷贝的 yaml(odp_meta 原样)。"""
+     src_yaml = _ensure_demo_yaml()
+     dst_root = tmp_path / name
+-    shutil.copytree(paths.dataset_processed_dir("demo"), dst_root)
++    source_doc = yaml.safe_load(src_yaml.read_text(encoding="utf-8"))
++    shutil.copytree(Path(source_doc["path"]), dst_root)
+     if mutate:
+         mutate(dst_root)
+     doc = yaml.safe_load(src_yaml.read_text(encoding="utf-8"))
+@@ -41,8 +72,7 @@
+     if mutate_yaml:
+         mutate_yaml(doc)
+     yp = tmp_path / f"{name}.yaml"
+-    yp.write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False),
+-                  encoding="utf-8")
++    yp.write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+     return yp
+
+
+@@ -52,84 +82,108 @@
+
+ # ---- 上篇夹具 ----
+
++
+ @pytest.fixture
+ def demo_yaml_missing_labels(tmp_path) -> Path:
+     """删掉 train 里每 5 个标签中的 1 个(≈16% → WARNING)。"""
++
+     def mutate(root: Path):
+         for i, lbl in enumerate(sorted((root / "labels" / "train").glob("*.txt"))):
+             if i % 5 == 0:
+                 lbl.unlink()
++
+     return _make_variant(tmp_path, "missing_labels", mutate)
+
+
+ @pytest.fixture
+ def demo_yaml_wrong_fingerprint(tmp_path) -> Path:
+     """yaml 指纹清零(张冠李戴)→ fingerprint_match ERROR。"""
+-    return _make_variant(tmp_path, "wrong_fp",
+-                         mutate_yaml=lambda doc: doc["odp_meta"].update(
+-                             contract_fingerprint="0" * 64))
++    return _make_variant(
++        tmp_path,
++        "wrong_fp",
++        mutate_yaml=lambda doc: doc["odp_meta"].update(contract_fingerprint="0" * 64),
++    )
+
+
+ @pytest.fixture
+ def demo_yaml_tampered_label(tmp_path) -> Path:
+     """改动一个标签的内容 → manifest_lineage 抓 changed。"""
++
+     def mutate(root: Path):
+         lbl = _first_label(root, "train")
+-        lbl.write_text(lbl.read_text(encoding="utf-8") + "1 0.50 0.50 0.20 0.20\n",
+-                       encoding="utf-8")
++        lbl.write_text(
++            lbl.read_text(encoding="utf-8") + "1 0.50 0.50 0.20 0.20\n", encoding="utf-8"
++        )
++
+     return _make_variant(tmp_path, "tampered_label", mutate)
+
+
+ # ---- 下篇夹具 ----
+
++
+ @pytest.fixture
+ def demo_yaml_bbox_overflow(tmp_path) -> Path:
+     """加一个出界框(右缘 1.08)→ bbox_within_image 抓(WARNING,占比 <10%)。"""
++
+     def mutate(root: Path):
+         lbl = _first_label(root, "train")
+-        lbl.write_text(lbl.read_text(encoding="utf-8") + "0 0.93 0.50 0.30 0.20\n",
+-                       encoding="utf-8")
++        lbl.write_text(
++            lbl.read_text(encoding="utf-8") + "0 0.93 0.50 0.30 0.20\n", encoding="utf-8"
++        )
++
+     return _make_variant(tmp_path, "bbox_overflow", mutate)
+
+
+ @pytest.fixture
+ def demo_yaml_bad_field_count(tmp_path) -> Path:
+     """一行只有 4 列 → label_format ERROR;bbox_within_image 跳过不重复报。"""
++
+     def mutate(root: Path):
+         lbl = _first_label(root, "train")
+-        lbl.write_text(lbl.read_text(encoding="utf-8") + "0 0.5 0.5 0.2\n",
+-                       encoding="utf-8")
++        lbl.write_text(lbl.read_text(encoding="utf-8") + "0 0.5 0.5 0.2\n", encoding="utf-8")
++
+     return _make_variant(tmp_path, "bad_field_count", mutate)
+
+
+ @pytest.fixture
+ def demo_yaml_leaked_sample(tmp_path) -> Path:
+     """把一张 train 图复制进 val → split_uniqueness 硬 ERROR。"""
++
+     def mutate(root: Path):
+         img = sorted((root / "images" / "train").glob("*"))[0]
+         shutil.copy2(img, root / "images" / "val" / img.name)
++
+     return _make_variant(tmp_path, "leaked_sample", mutate)
+
+
+ @pytest.fixture
+ def demo_yaml_class_missing_train(tmp_path) -> Path:
+     """train 里删光 反光衣(class 1)、并保证 val 里有一条 → missing_in_train WARNING。"""
++
+     def mutate(root: Path):
+         for lbl in (root / "labels" / "train").glob("*.txt"):
+-            kept = [l for l in lbl.read_text(encoding="utf-8").splitlines()
+-                    if l.strip() and not l.startswith("1 ")]
++            kept = [
++                line
++                for line in lbl.read_text(encoding="utf-8").splitlines()
++                if line.strip() and not line.startswith("1 ")
++            ]
+             lbl.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+         val_lbl = _first_label(root, "val")
+-        val_lbl.write_text(val_lbl.read_text(encoding="utf-8") + "1 0.50 0.50 0.20 0.20\n",
+-                           encoding="utf-8")
++        val_lbl.write_text(
++            val_lbl.read_text(encoding="utf-8") + "1 0.50 0.50 0.20 0.20\n", encoding="utf-8"
++        )
++
+     return _make_variant(tmp_path, "class_missing_train", mutate)
+
+
+ @pytest.fixture
+ def demo_yaml_degenerate_and_extreme(tmp_path) -> Path:
+     """w=0.0005 的框:既是退化框、也算极端宽高比 —— if-chain 只报 zero/tiny 一个。"""
++
+     def mutate(root: Path):
+         lbl = _first_label(root, "train")
+-        lbl.write_text(lbl.read_text(encoding="utf-8") + "0 0.50 0.50 0.0005 0.20\n",
+-                       encoding="utf-8")
++        lbl.write_text(
++            lbl.read_text(encoding="utf-8") + "0 0.50 0.50 0.0005 0.20\n", encoding="utf-8"
++        )
++
+     return _make_variant(tmp_path, "degenerate_and_extreme", mutate)
+
+```
+
+## 【新增代码】pyproject.toml
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/pyproject.toml
++++ 新增版本/pyproject.toml
+@@ -53,6 +53,7 @@
+     "tests",
+ ]
+ python_files = ["test_*.py"]
++pythonpath = ["apps/platform/src"]  # 新增：源码检出后即可运行 pytest
+ addopts = ["-v", "--strict-markers", "--tb=short"]
+
+ markers = [
+
+```
+
+## 【新增代码】requirements-dev.txt
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/requirements-dev.txt
++++ 新增版本/requirements-dev.txt
+@@ -0,0 +1,9 @@
++# 新增：数据工程与 Web 测试的轻量开发环境，不下载 torch/模型。
++-r apps/web-backend/requirements.txt
++pytest>=7.4
++pytest-cov>=4.1
++ruff==0.15.1
++pre-commit>=3.4
++colorlog>=6.7
++psutil>=5.9
++pydantic>=2.5,<3
+
+```
+
+## 【新增代码】.pre-commit-config.yaml
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/.pre-commit-config.yaml
++++ 新增版本/.pre-commit-config.yaml
+@@ -0,0 +1,14 @@
++# 新增：只检查本次提交中的 Python 文件，逐步接入现有多人协作项目。
++repos:
++  - repo: local
++    hooks:
++      - id: ruff-check
++        name: Ruff lint
++        entry: python -m ruff check
++        language: system
++        types: [python]
++      - id: ruff-format
++        name: Ruff format
++        entry: python -m ruff format --check
++        language: system
++        types: [python]
+
+```
+
+## 【新增代码】.github/workflows/data-engineering.yml
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/.github/workflows/data-engineering.yml
++++ 新增版本/.github/workflows/data-engineering.yml
+@@ -0,0 +1,27 @@
++name: Data engineering checks
++on:
++  push:
++    branches: [data_new_function]
++  pull_request:
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.11'
++      - run: python -m pip install -r requirements-dev.txt
++      - name: Check changed Python files
++        env:
++          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
++        run: |
++          if [ -z "$BASE_REF" ] || ! git cat-file -e "$BASE_REF^{commit}"; then
++            BASE_REF=$(git rev-list --max-parents=0 HEAD)
++          fi
++          python -m pre_commit run --from-ref "$BASE_REF" --to-ref HEAD
++      # 推理套件依赖 torch/ultralytics；本任务的轻量环境覆盖其余核心测试。
++      - run: python -m pytest --ignore=apps/platform/tests/test_inference_config.py
++      - run: python apps/web-backend/manage.py test defect --noinput
+
+```
+
+## 【新增代码】apps/platform/src/od_platform/common/progress.py
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/platform/src/od_platform/common/progress.py
++++ 新增版本/apps/platform/src/od_platform/common/progress.py
+@@ -0,0 +1,79 @@
++"""新增：D3/D4 共用进度事件；CLI 和 Web 使用同一份真实计数。"""
++
++from __future__ import annotations
++
++import sys
++import time
++from collections.abc import Callable, Iterable, Iterator
++from contextlib import contextmanager
++from contextvars import ContextVar
++from typing import TypeVar
++
++ProgressCallback = Callable[[dict], None]
++_callback: ContextVar[ProgressCallback | None] = ContextVar("odp_progress", default=None)
++T = TypeVar("T")
++
++
++@contextmanager
++def progress_scope(callback: ProgressCallback | None = None):
++    """每次运行隔离回调，嵌套调用保留外层回调，异常时也恢复上下文。"""
++    token = _callback.set(callback or _callback.get())
++    try:
++        yield
++    finally:
++        _callback.reset(token)
++
++
++def emit_progress(stage: str, completed: int = 0, total: int = 0) -> None:
++    callback = _callback.get()
++    if callback is not None:
++        callback(
++            {
++                "stage": stage,
++                "completed": completed,
++                "total": total,
++                "percent": round(completed / total * 100, 1) if total else 0.0,
++            }
++        )
++
++
++def track(items: Iterable[T], stage: str, total: int | None = None) -> Iterator[T]:
++    """完成一次工作后再递增；限制回调频率，避免大数据集被 UI 更新拖慢。"""
++    if total is None:
++        total = len(items) if hasattr(items, "__len__") else 0
++    emit_progress(stage, 0, total)
++    last = time.monotonic()
++    completed = 0
++    for item in items:
++        yield item
++        completed += 1
++        now = time.monotonic()
++        if now - last >= 0.1:
++            emit_progress(stage, completed, total)
++            last = now
++    emit_progress(stage, completed, total)
++
++
++class ConsoleProgress:
++    """新增：无第三方依赖的终端进度条；重定向输出时使用逐行日志。"""
++
++    def __init__(self, stream=None):
++        self.stream = stream or sys.stderr
++        self.stage = None
++
++    def __call__(self, event: dict) -> None:
++        stage, completed, total = event["stage"], event["completed"], event["total"]
++        tty = self.stream.isatty()
++        if not tty and stage == self.stage and total and completed < total:
++            return
++        if tty and self.stage is not None and stage != self.stage:
++            self.stream.write("\n")
++        self.stage = stage
++        filled = min(20, int(event["percent"] / 5))
++        bar = "#" * filled + "-" * (20 - filled)
++        count = f"{completed}/{total} {event['percent']:.1f}%" if total else "处理中"
++        prefix = "\r" if tty else ""
++        self.stream.write(
++            f"{prefix}[{bar}] {stage}: {count}" + ("\n" if not tty or stage == "complete" else "")
++        )
++        self.stream.flush()
+
+```
+
+## 【新增代码】apps/web-backend/config/settings.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/config/settings.py
++++ 新增版本/apps/web-backend/config/settings.py
+@@ -1,13 +1,16 @@
+ from __future__ import annotations
+
++import mimetypes
+ import os
+-import mimetypes
++import sys
+ from pathlib import Path
+
+ mimetypes.add_type("image/webp", ".webp")
+ mimetypes.add_type("video/mp4", ".mp4")
+
+ BASE_DIR = Path(__file__).resolve().parent.parent
++# 新增：从源码检出运行 Web 时也可调用 D3/D4，无需先安装训练依赖。
++sys.path.insert(0, str(BASE_DIR.parents[1] / "apps" / "platform" / "src"))
+
+ SECRET_KEY = os.getenv(
+     "DJANGO_SECRET_KEY",
+@@ -67,30 +70,10 @@
+ }
+
+ AUTH_PASSWORD_VALIDATORS = [
+-    {
+-        "NAME": (
+-            "django.contrib.auth.password_validation."
+-            "UserAttributeSimilarityValidator"
+-        )
+-    },
+-    {
+-        "NAME": (
+-            "django.contrib.auth.password_validation."
+-            "MinimumLengthValidator"
+-        )
+-    },
+-    {
+-        "NAME": (
+-            "django.contrib.auth.password_validation."
+-            "CommonPasswordValidator"
+-        )
+-    },
+-    {
+-        "NAME": (
+-            "django.contrib.auth.password_validation."
+-            "NumericPasswordValidator"
+-        )
+-    },
++    {"NAME": ("django.contrib.auth.password_validation.UserAttributeSimilarityValidator")},
++    {"NAME": ("django.contrib.auth.password_validation.MinimumLengthValidator")},
++    {"NAME": ("django.contrib.auth.password_validation.CommonPasswordValidator")},
++    {"NAME": ("django.contrib.auth.password_validation.NumericPasswordValidator")},
+ ]
+
+ LANGUAGE_CODE = "zh-hans"
+
+```
+
+## 【新增代码】apps/web-backend/config/urls.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/config/urls.py
++++ 新增版本/apps/web-backend/config/urls.py
+@@ -1,23 +1,18 @@
+ from __future__ import annotations
+
+-from django.conf import settings
+-from django.conf.urls.static import static
+-from django.contrib import admin
+-from django.urls import include, path
+-from django.views.static import serve
+-from rest_framework.routers import DefaultRouter
+-
+-from config.views import frontend_index
+ from defect.api_views import (
+     DefectRecordViewSet,
+     DefectTypeViewSet,
+     dashboard_overview,
+     dashboard_stats,
++    data_engineering,
++    data_job_control,
++    data_validation_history,
+     dataset_overview,
+     dataset_sample,
+-    model_overview,
+     model_evaluation,
+     model_evaluation_artifact,
++    model_overview,
+     recognition_record_detail,
+     recognition_records,
+     training_cancel,
+@@ -27,6 +22,14 @@
+     video_recognition_detail,
+     video_recognition_records,
+ )
++from django.conf import settings
++from django.conf.urls.static import static
++from django.contrib import admin
++from django.urls import include, path
++from django.views.static import serve
++from rest_framework.routers import DefaultRouter
++
++from config.views import frontend_index
+
+ router = DefaultRouter()
+ router.register("defect-type", DefectTypeViewSet, basename="defect-type")
+@@ -39,6 +42,9 @@
+     path("api/dashboard/", dashboard_overview, name="dashboard-overview"),
+     path("api/data/", dataset_overview, name="dataset-overview"),
+     path("api/data/validate/", validate_dataset, name="dataset-validate"),
++    path("api/data/jobs/", data_job_control, name="data-jobs"),
++    path("api/data/engineering/", data_engineering, name="data-engineering"),
++    path("api/data/history/", data_validation_history, name="data-history"),
+     path(
+         "api/data/sample/<str:split>/<str:filename>",
+         dataset_sample,
+
+```
+
+## 【新增代码】apps/web-backend/defect/api_views.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/defect/api_views.py
++++ 新增版本/apps/web-backend/defect/api_views.py
+@@ -1,13 +1,11 @@
+ from __future__ import annotations
+
+-import subprocess
+-import sys
+ from collections import Counter
+ from pathlib import Path
+ from uuid import uuid4
+
+ from django.core.files.base import ContentFile
+-from django.db.models import Count, Q
++from django.db.models import Count
+ from django.http import FileResponse
+ from django.utils import timezone
+ from rest_framework import filters, permissions, viewsets
+@@ -15,19 +13,20 @@
+ from rest_framework.parsers import FormParser, MultiPartParser
+ from rest_framework.response import Response
+
++from .data_jobs import data_jobs, dataset_history, engineering_catalog
+ from .data_understanding import (
+     DATASET_YAML,
+     dataset_sample_path,
+     get_dataset_understanding,
+ )
+ from .evaluation import evaluation_artifact, latest_evaluation, run_test_evaluation
++from .model_info import get_model_overview, latest_training_curve
+ from .models import (
+     DefectRecord,
+     DefectType,
+     RecognitionRecord,
+     VideoRecognitionRecord,
+ )
+-from .model_info import get_model_overview, latest_training_curve
+ from .recognition import recognize_image_file
+ from .serializers import (
+     DefectRecordSerializer,
+@@ -78,10 +77,7 @@
+         "high_confidence": records.filter(confidence__gte=0.8).count(),
+         "total_types": DefectType.objects.count(),
+         "average_confidence": round(
+-            (
+-                sum(records.values_list("confidence", flat=True))
+-                / max(records.count(), 1)
+-            ),
++            (sum(records.values_list("confidence", flat=True)) / max(records.count(), 1)),
+             3,
+         ),
+         "type_counts": list(type_counts),
+@@ -122,43 +118,78 @@
+     return FileResponse(sample.open("rb"), content_type=content_type)
+
+
+-@api_view(["POST"])
++@api_view(["GET", "POST"])
+ def validate_dataset(request):
+-    result = subprocess.run(
+-        [
+-            sys.executable,
+-            "-m",
+-            "od_platform.cli.validate_data",
+-            str(DATASET_YAML),
+-        ],
+-        cwd=str(DATASET_YAML.parents[4]),
+-        capture_output=True,
+-        text=True,
+-        encoding="utf-8",
+-        errors="replace",
+-        timeout=120,
+-    )
+-    details = get_dataset_understanding()
+-    return Response(
+-        {
+-            "success": result.returncode == 0,
+-            "exit_code": result.returncode,
+-            "validation": details.get("validation", {}),
+-            "summary": (
+-                "数据验证通过"
+-                if result.returncode == 0
+-                else "数据验证未通过，请查看命令行日志"
++    """新增：立即返回任务状态，耗时质检在后台执行。"""
++    if request.method == "GET":
++        return Response(data_jobs.status())
++    try:
++        return Response(
++            data_jobs.start("validate", request.data.get("dataset", DATASET_YAML.stem)), status=202
++        )
++    except RuntimeError as exc:
++        return Response({"detail": str(exc)}, status=409)
++    except (TypeError, ValueError) as exc:
++        return Response({"detail": str(exc)}, status=400)
++
++
++@api_view(["GET", "POST"])
++def data_job_control(request):
++    if request.method == "GET":
++        return Response(data_jobs.status())
++    try:
++        if (
++            request.data.get("operation", "transform") == "transform"
++            and training_jobs.status().get("status") == "running"
++        ):
++            return Response({"detail": "训练正在使用当前数据，请等待训练完成后再转换"}, status=409)
++        options = {
++            key: request.data[key]
++            for key in (
++                "format",
++                "task",
++                "classes",
++                "train_rate",
++                "val_rate",
++                "seed",
++                "split_strategy",
++            )
++            if key in request.data
++        }
++        return Response(
++            data_jobs.start(
++                request.data.get("operation", "transform"),
++                request.data.get("dataset", DATASET_YAML.stem),
++                **options,
+             ),
+-            "output_tail": "\n".join(result.stdout.splitlines()[-20:]),
+-        },
+-        status=200 if result.returncode == 0 else 422,
+-    )
++            status=202,
++        )
++    except RuntimeError as exc:
++        return Response({"detail": str(exc)}, status=409)
++    except (TypeError, ValueError, OverflowError) as exc:
++        return Response({"detail": str(exc)}, status=400)
++
++
++@api_view(["GET"])
++def data_engineering(request):
++    return Response(engineering_catalog())
++
++
++@api_view(["GET"])
++def data_validation_history(request):
++    try:
++        return Response(dataset_history(request.query_params.get("dataset", DATASET_YAML.stem)))
++    except ValueError as exc:
++        return Response({"detail": str(exc)}, status=400)
+
+
+ @api_view(["GET", "POST"])
+ def training_control(request):
+     if request.method == "GET":
+         return Response(training_jobs.status())
++    data_state = data_jobs.status()
++    if data_state.get("status") == "running" and data_state.get("operation") == "transform":
++        return Response({"detail": "数据转换尚未完成，请等待后再训练"}, status=409)
+     current = training_jobs.status()
+     if current.get("status") == "running":
+         return Response({"detail": "已有训练任务正在运行。"}, status=409)
+
+```
+
+## 【新增代码】apps/web-backend/defect/data_jobs.py
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/defect/data_jobs.py
++++ 新增版本/apps/web-backend/defect/data_jobs.py
+@@ -0,0 +1,188 @@
++"""新增：D3/D4 后台任务。与现有训练管理器一样用于单进程 Web 服务。"""
++
++from __future__ import annotations
++
++import copy
++import re
++import threading
++from datetime import datetime
++from uuid import uuid4
++
++import yaml
++
++from od_platform.common import paths
++from od_platform.common.constants import AnnotationFormat, SplitStrategy, Task
++from od_platform.data_pipeline.orchestrator import DatasetPipeline
++from od_platform.data_validation.history import report_history
++from od_platform.data_validation.registry import list_check_names
++from od_platform.data_validation.service import validate_dataset
++
++
++def dataset_name(value: str) -> str:
++    if not isinstance(value, str) or not re.fullmatch(r"[\w-]+", value) or value.startswith("."):
++        raise ValueError("数据集名称只能包含文字、数字、下划线和连字符")
++    return value
++
++
++def engineering_catalog() -> dict:
++    names = {p.stem for p in paths.DATASET_CONFIGS_DIR.glob("*.yaml")}
++    names.update(p.name for p in paths.RAW_DATA_DIR.glob("*") if p.is_dir())
++    datasets = []
++    for name in sorted(names):
++        try:
++            dataset_name(name)
++            document = (
++                yaml.safe_load(paths.dataset_yaml_path(name).read_text(encoding="utf-8")) or {}
++            )
++        except (OSError, ValueError, yaml.YAMLError):
++            document = {}
++        classes = document.get("names", []) if isinstance(document, dict) else []
++        if isinstance(classes, dict):
++            classes = [v for _, v in sorted(classes.items(), key=lambda item: int(item[0]))]
++        metadata = document.get("odp_meta", {}) if isinstance(document, dict) else {}
++        datasets.append(
++            {
++                "name": name,
++                "has_raw": paths.raw_dataset_root(name).is_dir(),
++                "has_yaml": paths.dataset_yaml_path(name).is_file(),
++                "classes": classes,
++                "format": metadata.get("source_format", "yolo"),
++                "task": metadata.get("task", "detect"),
++            }
++        )
++    return {
++        "datasets": datasets,
++        "checks": list_check_names(),
++        "formats": list(AnnotationFormat.all()),
++        "strategies": list(SplitStrategy.all()),
++    }
++
++
++class DataJobManager:
++    """新增：互斥执行转换/质检，轮询不会重读整个数据集或阻塞请求。"""
++
++    def __init__(self):
++        self._lock = threading.RLock()
++        self._state = {"status": "idle", "progress": {}, "result": None, "error": None}
++
++    def status(self) -> dict:
++        with self._lock:
++            state = copy.deepcopy(self._state)
++            if state.get("operation") == "validate" and state.get("result"):
++                state["result"] = _public_report(state["result"])
++            return state
++
++    def start(self, operation: str, dataset: str, **options) -> dict:
++        dataset_name(dataset)
++        if operation not in {"transform", "validate"}:
++            raise ValueError("operation 只能是 transform 或 validate")
++        if operation == "validate" and not paths.dataset_yaml_path(dataset).is_file():
++            raise ValueError("找不到数据集 YAML，请先运行 D3 转换")
++        if operation == "transform":
++            if not paths.raw_dataset_root(dataset).is_dir():
++                raise ValueError("找不到原始数据目录 data/raw/<dataset>")
++            if options.get("format", "yolo") not in AnnotationFormat.all():
++                raise ValueError("不支持的标注格式")
++            if options.get("task", "detect") not in Task.all():
++                raise ValueError("不支持的任务类型")
++            if options.get("split_strategy", "random") not in SplitStrategy.all():
++                raise ValueError("不支持的划分策略")
++            train, val = float(options.get("train_rate", 0.8)), float(options.get("val_rate", 0.1))
++            if not (0 < train < 1 and 0 <= val < 1 and train + val < 1):
++                raise ValueError("比例必须满足 0 < train < 1、val >= 0、train + val < 1")
++            options["train_rate"], options["val_rate"] = train, val
++            options["seed"] = int(options.get("seed", 42))
++            classes = options.get("classes")
++            if classes is not None and (
++                not isinstance(classes, list)
++                or not all(isinstance(c, str) and c.strip() for c in classes)
++            ):
++                raise ValueError("classes 应为非空类别名组成的数组")
++            if options.get("format", "yolo") == "yolo" and not classes:
++                raise ValueError("YOLO 转换必须填写类别顺序")
++        with self._lock:
++            if self._state["status"] == "running":
++                raise RuntimeError("已有数据任务正在执行，请等待完成")
++            self._state = {
++                "id": uuid4().hex,
++                "status": "running",
++                "operation": operation,
++                "dataset": dataset,
++                "started_at": datetime.now().isoformat(),
++                "progress": {"stage": "starting", "completed": 0, "total": 0, "percent": 0},
++                "result": None,
++                "error": None,
++            }
++            thread = threading.Thread(
++                target=self._execute, args=(operation, dataset, options), daemon=True
++            )
++            thread.start()
++            return self.status()
++
++    def _progress(self, event: dict):
++        with self._lock:
++            self._state["progress"] = event
++
++    def _execute(self, operation: str, dataset: str, options: dict):
++        try:
++            if operation == "transform":
++                result = DatasetPipeline(
++                    dataset,
++                    options.get("format", "yolo"),
++                    task=options.get("task", "detect"),
++                    classes=options.get("classes"),
++                    train_rate=options["train_rate"],
++                    val_rate=options["val_rate"],
++                    random_state=options["seed"],
++                    split_strategy=options.get("split_strategy", "random"),
++                    progress=self._progress,
++                ).run()
++            else:
++                result = validate_dataset(
++                    paths.dataset_yaml_path(dataset), progress=self._progress
++                ).to_dict()
++            with self._lock:
++                # 质检 ERROR 是已完成的质检结论；执行异常才是任务失败。
++                self._state.update(
++                    status="completed", result=result, finished_at=datetime.now().isoformat()
++                )
++        except Exception as exc:  # 后台线程的边界护栏：把错误返回页面。
++            with self._lock:
++                self._state.update(
++                    status="failed",
++                    error=f"{type(exc).__name__}: {exc}",
++                    finished_at=datetime.now().isoformat(),
++                )
++
++
++def _public_report(report: dict) -> dict:
++    """完整问题表留在磁盘，页面只显示有界预览及准确总数。"""
++    report = copy.deepcopy(report)
++    for result in report["results"]:
++        result.pop("issues", None)
++    comparison = report.get("comparison", {})
++    for key in ("new", "resolved"):
++        comparison[f"{key}_count"] = len(comparison.get(key, []))
++        comparison[key] = comparison.get(key, [])[:100]
++    return report
++
++
++def dataset_history(name: str) -> dict:
++    name = dataset_name(name)
++    reports = report_history(paths.dataset_yaml_path(name))
++    latest = _public_report(reports[0]) if reports else None
++    return {
++        "latest": latest,
++        "reports": [
++            {
++                "run_id": r["run_id"],
++                "severity": r["overall_severity"],
++                "duration_seconds": r.get("duration_seconds"),
++                "n_checks": len(r["results"]),
++            }
++            for r in reports[:50]
++        ],
++    }
++
++
++data_jobs = DataJobManager()
+
+```
+
+## 【新增代码】apps/web-backend/defect/model_info.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/defect/model_info.py
++++ 新增版本/apps/web-backend/defect/model_info.py
+@@ -46,11 +46,7 @@
+     candidates = completed or [
+         path
+         for path in TRAINING_RUNS_DIR.iterdir()
+-        if path.is_dir()
+-        and (
+-            (path / "results.csv").exists()
+-            or (path / "args.yaml").exists()
+-        )
++        if path.is_dir() and ((path / "results.csv").exists() or (path / "args.yaml").exists())
+     ]
+     if not candidates:
+         return None
+@@ -137,12 +133,13 @@
+     for report_path in candidates:
+         report = _read_json(report_path)
+         yaml_path = str(report.get("yaml_path", "")).replace("\\", "/")
+-        if dataset_name not in yaml_path:
++        if Path(yaml_path).stem != dataset_name:
+             continue
+         return {
+             "run_id": report.get("run_id"),
+             "severity": report.get("overall_severity"),
+             "duration_seconds": report.get("duration_seconds"),
++            "n_checks": len(report.get("results", [])),
+         }
+     return {}
+
+@@ -176,11 +173,15 @@
+     config_values = (audit.get("config", {}) or {}).get("values", {}) or {}
+
+     best_path = run_dir / "weights" / "best.pt"
+-    archived_weights = sorted(
+-        TRAINED_MODELS_DIR.glob("*-best.pt"),
+-        key=lambda path: path.stat().st_mtime,
+-        reverse=True,
+-    ) if TRAINED_MODELS_DIR.exists() else []
++    archived_weights = (
++        sorted(
++            TRAINED_MODELS_DIR.glob("*-best.pt"),
++            key=lambda path: path.stat().st_mtime,
++            reverse=True,
++        )
++        if TRAINED_MODELS_DIR.exists()
++        else []
++    )
+     archived_best = archived_weights[0] if archived_weights else None
+
+     curve_path = run_dir / "results.png"
+@@ -191,7 +192,9 @@
+         "created_at": audit.get("created_at"),
+         "dataset": {
+             "name": dataset_name,
+-            "classes": [str(value) for _, value in sorted(names.items(), key=lambda item: int(item[0]))],
++            "classes": [
++                str(value) for _, value in sorted(names.items(), key=lambda item: int(item[0]))
++            ],
+             "class_count": int(data_yaml.get("nc", len(names)) or len(names)),
+             "splits": split.get("counts", {}),
+             "strategy": split.get("strategy"),
+
+```
+
+## 【新增代码】apps/web-backend/requirements.txt
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/requirements.txt
++++ 新增版本/apps/web-backend/requirements.txt
+@@ -2,3 +2,5 @@
+ djangorestframework==3.18.3
+ django-cors-headers==4.9.0
+ Pillow>=10.0.0
++# 新增：Web 数据工程页面直接调用 D3/D4 的轻量依赖。
++PyYAML>=6.0
+
+```
+
+## 【新增代码】apps/web-backend/frontend/index.html
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/frontend/index.html
++++ 新增版本/apps/web-backend/frontend/index.html
+@@ -91,15 +91,15 @@
+             <div class="section-card">
+                 <div class="section-head">
+                     <div><h2>Rubbish_data_set 数据概览</h2><p>数据划分、类别分布和标注质量。</p></div>
+-                    <button class="primary small" @click="validateDataset" :disabled="validatingData">
++                    <button class="primary small" @click="validateDataset" :disabled="dataRunning || !selectedDataset?.has_yaml">
+                         {{ validatingData ? "正在验证..." : "重新验证数据" }}
+                     </button>
+                 </div>
+                 <div class="kpi-grid four compact">
+-                    <article class="kpi"><span>有效图片</span><b>{{ formatNumber(dataset.total_images) }}</b><small>全部有标签</small></article>
++                    <article class="kpi"><span>图片总数</span><b>{{ formatNumber(dataset.total_images) }}</b><small>质量结论见下方报告</small></article>
+                     <article class="kpi"><span>目标框</span><b>{{ formatNumber(dataset.total_boxes) }}</b><small>检测实例总数</small></article>
+                     <article class="kpi"><span>类别数</span><b>{{ dataset.class_count || 0 }}</b><small>{{ (dataset.classes || []).join(" · ") }}</small></article>
+-                    <article class="kpi"><span>质检结论</span><b class="success-text">{{ dataset.validation?.severity || "—" }}</b><small>{{ dataset.strategy || "固定划分" }}</small></article>
++                    <article class="kpi"><span>质检结论</span><b :class="severityClass(dataset.validation?.severity)">{{ dataset.validation?.severity || "—" }}</b><small>{{ dataset.strategy || "固定划分" }}</small></article>
+                 </div>
+                 <div class="two-grid">
+                     <article class="chart-card">
+@@ -136,11 +136,51 @@
+                 </div>
+             </div>
+             <div class="section-card pipeline-card">
+-                <div class="section-head"><div><h2>数据流水线</h2><p>当前数据已经冻结，训练不会重新随机划分。</p></div></div>
++                <div class="section-head"><div><h2>数据工程 · D3 / D4</h2><p>选择数据集执行转换或质检，查看真实阶段进度和历史变化。</p></div></div>
++                <!-- 新增代码开始：D3 转换入口、D4 进度与历史质检报告。 -->
++                <fieldset class="data-form" :disabled="dataRunning">
++                    <label class="field"><span>数据集</span><select v-model="dataForm.dataset" @change="selectEngineeringDataset"><option v-for="item in engineering.datasets" :key="item.name" :value="item.name">{{ item.name }}{{ item.has_raw ? ' · 有原始数据' : '' }}</option></select></label>
++                    <label class="field"><span>原始标注格式</span><select v-model="dataForm.format"><option v-for="item in engineering.formats" :key="item" :value="item">{{ item }}</option></select></label>
++                    <label class="field"><span>任务</span><select v-model="dataForm.task"><option value="detect">目标检测</option><option value="segment" :disabled="dataForm.format === 'pascal_voc'">实例分割</option></select></label>
++                    <label class="field"><span>划分策略</span><select v-model="dataForm.split_strategy"><option v-for="item in engineering.strategies" :key="item" :value="item">{{ item }}</option></select></label>
++                    <label class="field"><span>类别顺序（逗号分隔）</span><input v-model="dataForm.classes" placeholder="YOLO 格式必填，如 head, 反光衣"></label>
++                    <label class="field"><span>训练集比例</span><input v-model.number="dataForm.train_rate" type="number" min="0.01" max="0.99" step="0.01"></label>
++                    <label class="field"><span>验证集比例</span><input v-model.number="dataForm.val_rate" type="number" min="0" max="0.99" step="0.01"></label>
++                    <label class="field"><span>随机种子</span><input v-model.number="dataForm.seed" type="number"></label>
++                </fieldset>
++                <div class="data-actions">
++                    <button class="primary small" @click="startDataJob('transform')" :disabled="dataRunning || trainingRunning || !selectedDataset?.has_raw">运行 D3 转换与划分</button>
++                    <button class="secondary small" @click="validateDataset" :disabled="dataRunning || !selectedDataset?.has_yaml">运行 D4 质量检查</button>
++                    <span v-if="!selectedDataset?.has_raw">此数据集尚无原始目录，添加数据后可执行 D3。</span>
++                </div>
++                <div v-if="dataJob.status !== 'idle'" class="data-progress" role="status" aria-live="polite">
++                    <b>{{ dataJob.dataset }} · {{ dataJob.operation === 'transform' ? 'D3 转换' : 'D4 质检' }} · {{ {running:'执行中',completed:'已完成',failed:'执行失败'}[dataJob.status] }}</b>
++                    <p>{{ dataStageLabel }} <span v-if="dataJob.progress?.total">{{ dataJob.progress.completed }} / {{ dataJob.progress.total }} · {{ dataJob.progress.percent }}%</span></p>
++                    <progress :value="dataJob.progress?.total ? dataJob.progress.percent : undefined" max="100" aria-label="当前阶段进度"></progress>
++                    <small>进度百分比对应当前阶段；阶段切换后重新计数。</small>
++                    <p v-if="dataJob.error" class="severity-error">{{ dataJob.error }}</p>
++                    <p v-if="dataJob.result?.counts">产出：训练 {{ dataJob.result.counts.train }} / 验证 {{ dataJob.result.counts.val }} / 测试 {{ dataJob.result.counts.test }} 张</p>
++                </div>
++                <div class="data-report" v-if="dataHistory.latest">
++                    <h3>{{ dataForm.dataset }} · 最新质检报告 <span :class="severityClass(dataHistory.latest.overall_severity)">{{ dataHistory.latest.overall_severity }}</span></h3>
++                    <p>{{ dataHistory.latest.run_id }} · {{ dataHistory.latest.duration_seconds }} 秒 · {{ dataHistory.latest.results.length }} 项检查</p>
++                    <div class="data-table-wrap"><table class="data-table"><thead><tr><th>检查项</th><th>结论</th><th>说明</th></tr></thead><tbody><tr v-for="item in dataHistory.latest.results" :key="item.name"><td>{{ item.name }}</td><td :class="severityClass(item.severity)">{{ item.severity }}</td><td>{{ item.summary }}</td></tr></tbody></table></div>
++                    <h3>与上次质检对比</h3>
++                    <p v-if="!comparison.baseline_run_id">首次质检，已建立历史基线。</p>
++                    <template v-else>
++                        <p>上次运行 {{ comparison.baseline_run_id }} · 新增 {{ comparison.new_count || 0 }} · 已修复 {{ comparison.resolved_count || 0 }} · 持续存在 {{ comparison.persistent_count || 0 }}</p>
++                        <small>图片、标签、边界与契约按文件/行比较；其余原有检查按检查项比较。每类最多显示 100 条。</small>
++                        <details v-for="group in [{key:'new',label:'新增问题'},{key:'resolved',label:'已修复问题'}]" :key="group.key"><summary>{{ group.label }}（{{ comparison[group.key + '_count'] || 0 }}）</summary><ul><li v-for="(issue,index) in comparison[group.key]" :key="index">{{ issue.check }} · {{ issue.split }} / {{ issue.file || '检查项' }} {{ issue.line_no ? '第 ' + issue.line_no + ' 行' : '' }} · {{ issue.kind }} {{ issue.message }}</li></ul></details>
++                        <p v-for="item in comparison.severity_changes" :key="item.check">{{ item.check }}：{{ item.before }} → {{ item.after }}</p>
++                    </template>
++                    <details><summary>最近 {{ dataHistory.reports.length }} 次质检记录</summary><ul><li v-for="item in dataHistory.reports" :key="item.run_id">{{ item.run_id }} · {{ item.severity }} · {{ item.n_checks }} 项 · {{ item.duration_seconds }} 秒</li></ul></details>
++                </div>
++                <p v-else class="chart-note">此数据集暂无历史质检报告，请运行 D4 建立基线。</p>
++                <!-- 新增代码结束 -->
+                 <div class="pipeline">
+                     <div><b>RAW</b><span>原始 YOLO 图片与标签</span></div><i>→</i>
+                     <div><b>TRANSFORM</b><span>格式校验、固定划分、物化</span></div><i>→</i>
+-                    <div><b>VALIDATE</b><span>15 项质量检查</span></div><i>→</i>
++                    <div><b>VALIDATE</b><span>{{ engineering.checks.length }} 项质量检查与历史对比</span></div><i>→</i>
+                     <div><b>READY</b><span>可重复训练的数据集 YAML</span></div>
+                 </div>
+             </div>
+
+```
+
+## 【新增代码】apps/web-backend/frontend/static/frontend/app.js
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/frontend/static/frontend/app.js
++++ 新增版本/apps/web-backend/frontend/static/frontend/app.js
+@@ -120,6 +120,31 @@
+         const validatingData = ref(false);
+         const evaluatingModel = ref(false);
+         let trainingPollTimer = null;
++        // 新增：数据工程后台任务、真实阶段进度与历史报告。
++        const engineering = reactive({ datasets: [], checks: [], formats: [], strategies: [] });
++        const dataForm = reactive({ dataset: "Rubbish_data_set", format: "yolo", task: "detect",
++            classes: "", train_rate: 0.8, val_rate: 0.1, seed: 42, split_strategy: "random" });
++        const dataJob = reactive({ status: "idle", progress: {}, result: null, error: null });
++        const dataHistory = reactive({ latest: null, reports: [] });
++        const dataSubmitting = ref(false);
++        const dataRunning = computed(() => dataSubmitting.value || dataJob.status === "running");
++        const selectedDataset = computed(() => engineering.datasets.find((d) => d.name === dataForm.dataset));
++        const comparison = computed(() => dataHistory.latest?.comparison || {});
++        const severityClass = (severity) => ({ ERROR: "severity-error", WARNING: "severity-warning",
++            INFO: "severity-info", PASS: "severity-pass" }[severity] || "");
++        const dataStageLabel = computed(() => {
++            const stage = dataJob.progress?.stage || "starting";
++            const [name, detail] = stage.split(":");
++            const labels = { starting: "准备任务", prepare: "检查原始数据", convert: "转换标注",
++                discover_classes: "发现类别", index: "建立标注索引", scan_labels: "扫描转换结果",
++                split: "固定种子划分", manifest: "生成划分契约", materialize: "复制图片与标签",
++                write_yaml: "写入数据集配置", snapshot: "扫描数据集", checks: "执行质量检查",
++                image_integrity: "图片完整性与解码", label_format: "标签格式、类别与归一化",
++                bbox_within_image: "检查目标框边界", manifest_lineage: "逐样本 SHA256 核验",
++                report: "生成报告和历史对比", complete: "全部阶段完成" };
++            return `${labels[name] || name}${detail ? ` · ${detail}` : ""}`;
++        });
++        let dataPollTimer = null;
+
+         const inferenceFile = ref(null);
+         const inferencePreview = ref("");
+@@ -311,6 +336,7 @@
+                 recognitionHistory.value = recognitionResponse.data;
+                 videoHistory.value = videoResponse.data;
+                 Object.assign(trainingState, trainingResponse.data);
++                await loadDataEngineering();
+                 apiOnline.value = true;
+                 if (trainingState.status === "running") scheduleTrainingPoll();
+                 if (!mediaResult.value && recognitionResponse.data.length) {
+@@ -360,16 +386,67 @@
+             }
+         };
+         const validateDataset = async () => {
+-            validatingData.value = true;
+-            try {
+-                const response = await axios.post(`${API}/data/validate/`);
+-                showToast(response.data.summary || "数据验证完成");
+-                await loadAll(false);
++            await startDataJob("validate");
++        };
++        const loadDataHistory = async () => {
++            const selected = dataForm.dataset;
++            const response = await axios.get(`${API}/data/history/`, { params: { dataset: selected } });
++            if (dataForm.dataset === selected) Object.assign(dataHistory, response.data);
++        };
++        const selectEngineeringDataset = async () => {
++            const selected = selectedDataset.value;
++            if (selected) {
++                dataForm.classes = (selected.classes || []).join(", ");
++                dataForm.format = engineering.formats.includes(selected.format) ? selected.format : "yolo";
++                dataForm.task = selected.task || "detect";
++            }
++            try { await loadDataHistory(); } catch (error) { showToast(getError(error), "error"); }
++        };
++        const scheduleDataPoll = () => {
++            if (dataPollTimer) window.clearTimeout(dataPollTimer);
++            dataPollTimer = window.setTimeout(pollDataJob, 800);
++        };
++        const pollDataJob = async () => {
++            try {
++                const response = await axios.get(`${API}/data/jobs/`);
++                Object.assign(dataJob, response.data);
++                validatingData.value = dataJob.status === "running";
++                if (dataJob.status === "running") scheduleDataPoll();
++                else {
++                    await loadAll(false);
++                    showToast(dataJob.status === "failed" ? dataJob.error : "数据任务已完成，请查看报告",
++                        dataJob.status === "failed" ? "error" : "success");
++                }
+             } catch (error) {
+                 showToast(getError(error), "error");
+-            } finally {
+-                validatingData.value = false;
+-            }
++                scheduleDataPoll();
++            }
++        };
++        const loadDataEngineering = async () => {
++            const [catalog, job] = await Promise.all([
++                axios.get(`${API}/data/engineering/`), axios.get(`${API}/data/jobs/`),
++            ]);
++            const firstLoad = engineering.datasets.length === 0;
++            Object.assign(engineering, catalog.data);
++            Object.assign(dataJob, job.data);
++            validatingData.value = dataJob.status === "running";
++            if (!selectedDataset.value && engineering.datasets.length) dataForm.dataset = engineering.datasets[0].name;
++            if (firstLoad) await selectEngineeringDataset();
++            else await loadDataHistory();
++            if (dataJob.status === "running") scheduleDataPoll();
++        };
++        const startDataJob = async (operation) => {
++            dataSubmitting.value = true;
++            try {
++                const payload = { ...dataForm, operation,
++                    classes: dataForm.classes.split(/[,，\n]/).map((c) => c.trim()).filter(Boolean) };
++                if (payload.format !== "yolo" && !payload.classes.length) delete payload.classes;
++                const response = await axios.post(`${API}/data/jobs/`, payload);
++                Object.assign(dataJob, response.data);
++                validatingData.value = true;
++                scheduleDataPoll();
++            } catch (error) { showToast(getError(error), "error"); }
++            finally { dataSubmitting.value = false; }
+         };
+         const evaluateModel = async () => {
+             evaluatingModel.value = true;
+@@ -580,6 +657,7 @@
+
+         onMounted(loadAll);
+         onBeforeUnmount(() => {
++            if (dataPollTimer) window.clearTimeout(dataPollTimer);
+             if (trainingPollTimer) window.clearTimeout(trainingPollTimer);
+             if (toast.timer) window.clearTimeout(toast.timer);
+             [inferencePreview, mediaImagePreview, mediaVideoPreview].forEach((item) => releaseUrl(item.value));
+@@ -593,6 +671,8 @@
+             apiOnline,
+             toast,
+             dataset,
++            engineering, dataForm, dataJob, dataHistory, dataRunning, selectedDataset,
++            comparison, severityClass, dataStageLabel, selectEngineeringDataset, startDataJob,
+             dashboard,
+             modelInfo,
+             modelStatusLabel,
+
+```
+
+## 【新增代码】apps/web-backend/frontend/static/frontend/styles.css
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/frontend/static/frontend/styles.css
++++ 新增版本/apps/web-backend/frontend/static/frontend/styles.css
+@@ -314,3 +314,21 @@
+     .table-tools input { width:100%; }
+     .toast { right:12px; bottom:12px; left:12px; }
+ }
++/* 新增：D3/D4 数据工程控制区、阶段进度与可横向滚动的质检表格。 */
++.data-form { border:0; padding:0; margin:20px 0; display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:16px; }
++.data-form select { width:100%; min-height:40px; border:1px solid #d8e0eb; border-radius:8px; padding:8px; background:white; color:#23344d; }
++.data-actions { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin:16px 0; }
++.data-actions span,.data-progress small,.data-report small { color:#68788e; }
++.data-progress { background:#f0f5fc; padding:18px; border-radius:12px; margin:18px 0; }
++.data-progress progress { width:100%; height:18px; accent-color:#3874e7; }
++.data-report { margin:24px 0; }
++.data-table-wrap { max-width:100%; overflow-x:auto; margin:16px 0; }
++.data-table { width:100%; border-collapse:collapse; font-size:13px; text-align:left; }
++.data-table td,.data-table th { padding:10px 12px; border-bottom:1px solid #e2e8f0; vertical-align:top; }
++.data-report details { margin:14px 0; overflow-wrap:anywhere; }
++.data-report summary { cursor:pointer; font-weight:600; }
++.data-report li { margin:7px 0; }
++.severity-error { color:#bf233c; }
++.severity-warning { color:#9b6200; }
++.severity-info { color:#2862b0; }
++.severity-pass { color:#157648; }
+
+```
+
+## 【新增代码】apps/web-backend/defect/tests.py
+
+注释：原文件扩展：+ 为新增代码，- 为必要替换/格式整理。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/defect/tests.py
++++ 新增版本/apps/web-backend/defect/tests.py
+@@ -1,7 +1,10 @@
+ from __future__ import annotations
+
++import tempfile
++from pathlib import Path
+ from unittest.mock import MagicMock, patch
+
++import yaml
+ from django.core.files.uploadedfile import SimpleUploadedFile
+ from django.test import TestCase
+ from PIL import Image
+@@ -30,6 +33,13 @@
+
+ class DefectApiTests(TestCase):
+     def setUp(self):
++        # 新增：Web 回归测试的图片和模型占位文件全部留在临时目录。
++        temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(temporary.cleanup)
++        self.temp_root = Path(temporary.name)
++        media_settings = self.settings(MEDIA_ROOT=self.temp_root / "media")
++        media_settings.enable()
++        self.addCleanup(media_settings.disable)
+         self.client = APIClient()
+         self.defect_type, _ = DefectType.objects.get_or_create(
+             type_name="测试划痕",
+@@ -151,7 +161,18 @@
+         self.assertIn("detail", response.data)
+
+     def test_dataset_and_dashboard_endpoints(self):
+-        dataset = self.client.get("/api/data/")
++        images = self.temp_root / "images" / "train"
++        images.mkdir(parents=True)
++        Image.new("RGB", (32, 32)).save(images / "sample.jpg")
++        config = self.temp_root / "dataset.yaml"
++        config.write_text(
++            yaml.safe_dump(
++                {"path": str(self.temp_root), "nc": 10, "names": [f"class_{i}" for i in range(10)]}
++            ),
++            encoding="utf-8",
++        )
++        with patch("defect.data_understanding.DATASET_YAML", config):
++            dataset = self.client.get("/api/data/")
+         self.assertEqual(dataset.status_code, 200)
+         self.assertEqual(dataset.data["class_count"], 10)
+         self.assertGreater(dataset.data["total_images"], 0)
+@@ -214,13 +235,19 @@
+         process.poll.return_value = None
+         popen_mock.return_value = process
+         manager = TrainingJobManager()
+-
+-        snapshot = manager.start(
+-            epochs=1,
+-            imgsz=416,
+-            batch="16",
+-            device="cpu",
+-        )
++        model = self.temp_root / "models" / "pretrained" / "yolov8n.pt"
++        model.parent.mkdir(parents=True)
++        model.touch()  # Popen 已 mock，测试只需存在性，不下载模型。
++        with (
++            patch("defect.training_jobs.PROJECT_ROOT", self.temp_root),
++            patch("defect.training_jobs.WEB_TRAINING_RUNS", self.temp_root / "runs"),
++        ):
++            snapshot = manager.start(
++                epochs=1,
++                imgsz=416,
++                batch="16",
++                device="cpu",
++            )
+         self.assertEqual(snapshot["status"], "running")
+         self.assertEqual(snapshot["total_epochs"], 1)
+
+
+```
+
+## 【新增代码】apps/web-backend/defect/test_data_jobs.py
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/web-backend/defect/test_data_jobs.py
++++ 新增版本/apps/web-backend/defect/test_data_jobs.py
+@@ -0,0 +1,132 @@
++"""新增：D3/D4 Web API 与后台任务回归，无需模型和真实业务数据。"""
++
++from __future__ import annotations
++
++import tempfile
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++from django.test import SimpleTestCase
++from PIL import Image
++from rest_framework.test import APIClient
++
++from od_platform.common import paths, stamp
++
++from .data_jobs import DataJobManager
++
++
++class DataEngineeringApiTests(SimpleTestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temporary.cleanup)
++        root = Path(self.temporary.name)
++        values = {
++            "ROOT_DIR": root,
++            "RAW_DATA_DIR": root / "raw",
++            "PROCESSED_DATA_DIR": root / "processed",
++            "RUNS_DIR": root / "runs",
++            "DATASET_CONFIGS_DIR": root / "configs",
++            "VALIDATION_RUNS_DIR": root / "validation",
++        }
++        for key, value in values.items():
++            replacement = patch.object(paths, key, value)
++            replacement.start()
++            self.addCleanup(replacement.stop)
++        replacement = patch.object(stamp, "LINEAGE_DIR", root / "lineage")
++        replacement.start()
++        self.addCleanup(replacement.stop)
++        self.manager = DataJobManager()
++        replacement = patch("defect.api_views.data_jobs", self.manager)
++        replacement.start()
++        self.addCleanup(replacement.stop)
++        self.client = APIClient()
++        raw = paths.raw_dataset_root("tiny")
++        (raw / "images").mkdir(parents=True)
++        (raw / "labels").mkdir()
++        for i in range(12):
++            Image.new("RGB", (32, 32)).save(raw / "images" / f"{i}.jpg")
++            (raw / "labels" / f"{i}.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
++
++    def wait_complete(self):
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            response = self.client.get("/api/data/jobs/")
++            if response.data["status"] != "running":
++                self.assertEqual(response.data["status"], "completed", response.data)
++                return response.data
++            time.sleep(0.01)
++        self.fail("数据任务未在 10 秒内完成")
++
++    def transform(self):
++        response = self.client.post(
++            "/api/data/jobs/",
++            {"operation": "transform", "dataset": "tiny", "format": "yolo", "classes": ["item"]},
++            format="json",
++        )
++        self.assertEqual(response.status_code, 202, response.data)
++        return self.wait_complete()
++
++    def test_catalog_to_transform_to_validation_and_history(self):
++        catalog = self.client.get("/api/data/engineering/")
++        self.assertEqual(catalog.status_code, 200)
++        self.assertIn("image_integrity", catalog.data["checks"])
++        self.assertTrue(catalog.data["datasets"][0]["has_raw"])
++        self.assertEqual(sum(self.transform()["result"]["counts"].values()), 12)
++        response = self.client.post("/api/data/validate/", {"dataset": "tiny"}, format="json")
++        self.assertEqual(response.status_code, 202, response.data)
++        result = self.wait_complete()
++        self.assertEqual(result["progress"]["stage"], "complete")
++        self.assertIn(result["result"]["overall_severity"], {"PASS", "INFO"})
++        history = self.client.get("/api/data/history/?dataset=tiny")
++        self.assertEqual(len(history.data["reports"]), 1)
++        self.assertEqual(len(history.data["latest"]["results"]), 16)
++        self.assertNotIn("issues", history.data["latest"]["results"][0])
++
++    def test_quality_errors_are_completed_results_and_fixes_are_visible(self):
++        self.transform()
++        image = next((paths.dataset_processed_dir("tiny") / "images" / "train").glob("*.jpg"))
++        original = image.read_bytes()
++        image.write_bytes(b"broken")
++        self.client.post("/api/data/validate/", {"dataset": "tiny"}, format="json")
++        self.assertEqual(self.wait_complete()["result"]["overall_severity"], "ERROR")
++        image.write_bytes(original)
++        self.client.post("/api/data/validate/", {"dataset": "tiny"}, format="json")
++        self.wait_complete()
++        comparison = self.client.get("/api/data/history/?dataset=tiny").data["latest"]["comparison"]
++        self.assertEqual(comparison["resolved_count"], 1)
++        self.assertEqual(comparison["resolved"][0]["check"], "image_integrity")
++
++    def test_invalid_inputs_and_missing_sources(self):
++        for data in [
++            {"dataset": "../escape"},
++            {"dataset": "missing"},
++            {"dataset": "tiny", "format": "unknown"},
++            {"dataset": "tiny", "format": "yolo", "classes": []},
++            {"dataset": "tiny", "classes": ["x"], "train_rate": 0.9, "val_rate": 0.2},
++            {"dataset": "tiny", "classes": ["x"], "train_rate": "NaN"},
++            {"dataset": "tiny", "classes": "not-an-array"},
++        ]:
++            response = self.client.post("/api/data/jobs/", data, format="json")
++            self.assertEqual(response.status_code, 400, response.data)
++        self.assertEqual(
++            self.client.post("/api/data/validate/", {"dataset": "tiny"}).status_code, 400
++        )
++        self.assertEqual(self.client.get("/api/data/history/?dataset=../escape").status_code, 400)
++
++    def test_busy_tasks_reject_duplicate_submissions(self):
++        self.manager._state["status"] = "running"
++        response = self.client.post(
++            "/api/data/jobs/", {"dataset": "tiny", "classes": ["x"]}, format="json"
++        )
++        self.assertEqual(response.status_code, 409)
++
++    def test_worker_failure_is_returned_to_browser(self):
++        with patch("defect.data_jobs.DatasetPipeline", side_effect=ValueError("bad source")):
++            self.manager._state = {"status": "running"}
++            self.manager._execute(
++                "transform", "tiny", {"train_rate": 0.8, "val_rate": 0.1, "seed": 42}
++            )
++        status = self.manager.status()
++        self.assertEqual(status["status"], "failed")
++        self.assertIn("bad source", status["error"])
+
+```
+
+## 【新增代码】apps/platform/tests/test_data_engineering.py
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/apps/platform/tests/test_data_engineering.py
++++ 新增版本/apps/platform/tests/test_data_engineering.py
+@@ -0,0 +1,287 @@
++"""新增：数据工程功能回归；全部测试使用临时数据与真实解码器。"""
++
++from __future__ import annotations
++
++import io
++import json
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++import yaml
++from PIL import Image
++
++from od_platform.common import paths, stamp
++from od_platform.common.progress import ConsoleProgress, emit_progress, progress_scope, track
++from od_platform.data_pipeline.orchestrator import DatasetPipeline
++from od_platform.data_validation.checks.label_format import _validate_one_line
++from od_platform.data_validation.history import compare_reports, report_history
++from od_platform.data_validation.registry import CheckContext, get_check
++from od_platform.data_validation.service import validate_dataset
++from od_platform.data_validation.snapshot import build_snapshot
++
++
++@pytest.fixture
++def dataset_yaml(tmp_path, monkeypatch):
++    root = tmp_path / "processed"
++    for kind in ("images", "labels"):
++        (root / kind / "train").mkdir(parents=True)
++    for i in range(3):
++        Image.new("RGB", (32, 32), (20, 80, 120)).save(root / "images" / "train" / f"s{i}.jpg")
++        (root / "labels" / "train" / f"s{i}.txt").write_text(
++            "0 0.5 0.5 0.2 0.2\n", encoding="utf-8"
++        )
++    config = tmp_path / "sample.yaml"
++    config.write_text(
++        yaml.safe_dump({"path": str(root), "train": "images/train", "nc": 1, "names": ["object"]}),
++        encoding="utf-8",
++    )
++    monkeypatch.setattr(paths, "VALIDATION_RUNS_DIR", tmp_path / "validation")
++    return config
++
++
++def run_check(config, name):
++    return get_check(name).func(CheckContext(config, build_snapshot(config)))
++
++
++@pytest.mark.parametrize(
++    "line,kind",
++    [
++        ("1 0.5 0.5 0.2 0.2", "class_id_out_of_range"),
++        ("-1 0.5 0.5 0.2 0.2", "class_id_out_of_range"),
++        ("0 1.1 0.5 0.2 0.2", "coord_out_of_range"),
++        ("0 0.5 -0.1 0.2 0.2", "coord_out_of_range"),
++        ("0 nan 0.5 0.2 0.2", "parse_error"),
++        ("0 0.5 inf 0.2 0.2", "parse_error"),
++        ("0 0.5 0.5 -inf 0.2", "parse_error"),
++        ("0 0.5 0.5 0 0.2", "non_positive_box_size"),
++        ("0.5 0.5 0.5 0.2 0.2", "parse_error"),
++        ("0 0.5 0.5 0.2", "field_count_mismatch"),
++    ],
++)
++def test_label_invalid_values(line, kind):
++    assert _validate_one_line(line, "detect", 1)[1] == kind
++
++
++def test_class_and_coordinate_boundaries():
++    assert _validate_one_line("0 0.5 0.5 1 1", "detect", 1)[1] is None
++    assert _validate_one_line("1 0 0 1 0 1 1", "segment", 2)[1] is None
++    assert _validate_one_line("2 0 0 1 0 1 1", "segment", 2)[1] == "class_id_out_of_range"
++
++
++@pytest.mark.parametrize("damage", [b"", b"not an image", b"\xff\xd8\xff\xe0"])
++def test_image_integrity_detects_corruption(dataset_yaml, damage):
++    snap = build_snapshot(dataset_yaml)
++    snap.images_per_split["train"][0].write_bytes(damage)
++    result = run_check(dataset_yaml, "image_integrity")
++    assert result.severity == "ERROR"
++    assert result.details["n_bad"] == 1
++    assert len(result.issues) == 1
++
++
++def test_image_integrity_decodes_pixels_and_reports_progress(dataset_yaml):
++    events = []
++    with progress_scope(events.append):
++        result = run_check(dataset_yaml, "image_integrity")
++    assert result.severity == "PASS"
++    assert events[-1] == {"stage": "image_integrity", "completed": 3, "total": 3, "percent": 100.0}
++
++
++def test_image_integrity_rejects_truncated_pixel_data(dataset_yaml):
++    image = build_snapshot(dataset_yaml).images_per_split["train"][0]
++    image.write_bytes(image.read_bytes()[:-20])
++    assert run_check(dataset_yaml, "image_integrity").severity == "ERROR"
++
++
++def test_unreadable_labels_do_not_count_as_fixed_issues():
++    previous = {
++        "run_id": "old",
++        "results": [
++            {
++                "name": "label_format",
++                "severity": "ERROR",
++                "issues": [
++                    {"split": "train", "file": "x.txt", "line_no": 1, "kind": "coord_out_of_range"}
++                ],
++            }
++        ],
++    }
++    current = {
++        "results": [
++            {
++                "name": "label_format",
++                "severity": "ERROR",
++                "issues": [{"split": "train", "file": "x.txt", "kind": "read_error"}],
++            }
++        ]
++    }
++    delta = compare_reports(current, previous)
++    assert delta["resolved"] == []
++    assert delta["new"][0]["kind"] == "read_error"
++
++
++def test_history_reestablishes_baseline_for_older_check_granularity():
++    previous = {
++        "run_id": "old",
++        "results": [{"name": "label_format", "severity": "ERROR", "summary": "bad"}],
++    }
++    current = {
++        "results": [
++            {
++                "name": "label_format",
++                "severity": "ERROR",
++                "issues": [{"file": "x.txt", "kind": "coord_out_of_range"}],
++            }
++        ]
++    }
++    delta = compare_reports(current, previous)
++    assert delta["new"] == delta["resolved"] == []
++
++
++def test_unicode_label_read_error_is_a_finding(dataset_yaml):
++    build_snapshot(dataset_yaml).label_files_per_split["train"][0].write_bytes(b"\xff\xfe")
++    result = run_check(dataset_yaml, "label_format")
++    assert result.severity == "ERROR"
++    assert result.issues[0]["kind"] == "read_error"
++
++
++def test_bbox_edges_can_overflow_with_normalized_coordinates(dataset_yaml):
++    label = build_snapshot(dataset_yaml).label_files_per_split["train"][0]
++    label.write_text("0 0.95 0.5 0.2 0.2\n", encoding="utf-8")
++    assert run_check(dataset_yaml, "label_format").severity == "PASS"
++    assert run_check(dataset_yaml, "bbox_within_image").details["n_out"] == 1
++
++
++def test_history_tracks_new_and_fixed_images(dataset_yaml):
++    first = validate_dataset(dataset_yaml)
++    assert first.comparison["baseline_run_id"] is None
++    image = build_snapshot(dataset_yaml).images_per_split["train"][0]
++    original = image.read_bytes()
++    image.write_bytes(b"broken")
++    second = validate_dataset(dataset_yaml)
++    assert second.comparison["baseline_run_id"] == first.run_id
++    assert any(i["check"] == "image_integrity" for i in second.comparison["new"])
++    image.write_bytes(original)
++    third = validate_dataset(dataset_yaml)
++    assert any(i["check"] == "image_integrity" for i in third.comparison["resolved"])
++    reports = report_history(dataset_yaml)
++    assert len({r["run_id"] for r in reports}) == 3
++    assert reports[0]["run_id"] == third.run_id
++    assert not list(paths.VALIDATION_RUNS_DIR.glob("*/*.tmp"))
++
++
++def test_history_isolates_datasets_and_ignores_broken_json(dataset_yaml):
++    first = validate_dataset(dataset_yaml)
++    other = dataset_yaml.with_name("other.yaml")
++    other.write_bytes(dataset_yaml.read_bytes())
++    assert validate_dataset(other).comparison["baseline_run_id"] is None
++    broken = paths.VALIDATION_RUNS_DIR / "broken" / "report.json"
++    broken.parent.mkdir()
++    broken.write_text("{", encoding="utf-8")
++    assert report_history(dataset_yaml)[0]["run_id"] == first.run_id
++
++
++def test_history_does_not_truncate_or_confuse_same_issue_counts():
++    def report(start):
++        return {
++            "run_id": str(start),
++            "results": [
++                {
++                    "name": "image_integrity",
++                    "severity": "ERROR",
++                    "issues": [
++                        {"file": f"{i}.jpg", "kind": "decode_error"}
++                        for i in range(start, start + 150)
++                    ],
++                }
++            ],
++        }
++
++    delta = compare_reports(report(1), report(0))
++    assert len(delta["new"]) == len(delta["resolved"]) == 1
++    assert delta["persistent_count"] == 149
++
++
++def test_crashed_check_is_not_reported_as_fixed():
++    previous = {
++        "run_id": "before",
++        "results": [{"name": "test", "severity": "ERROR", "summary": "bad"}],
++    }
++    current = {
++        "results": [
++            {
++                "name": "test",
++                "severity": "ERROR",
++                "summary": "crash",
++                "details": {"exception": "error"},
++            }
++        ]
++    }
++    assert compare_reports(current, previous)["resolved"] == []
++
++
++def test_no_report_and_duplicate_run_ids(dataset_yaml):
++    validate_dataset(dataset_yaml, write_report=False)
++    assert not paths.VALIDATION_RUNS_DIR.exists()
++    validate_dataset(dataset_yaml, run_id="fixed")
++    with pytest.raises(ValueError, match="已存在"):
++        validate_dataset(dataset_yaml, run_id="fixed")
++    with pytest.raises(ValueError, match="run_id"):
++        validate_dataset(dataset_yaml, run_id="../outside")
++
++
++def test_thread_progress_isolation_and_exception_cleanup():
++    def worker(name):
++        events = []
++        with progress_scope(events.append):
++            list(track(range(4), name))
++        return events
++
++    with ThreadPoolExecutor(max_workers=2) as executor:
++        for name, events in zip(("one", "two"), executor.map(worker, ("one", "two")), strict=True):
++            assert {e["stage"] for e in events} == {name}
++            assert events[-1]["completed"] == 4
++    events = []
++    with pytest.raises(RuntimeError), progress_scope(events.append):
++        raise RuntimeError("abort")
++    emit_progress("outside")
++    assert events == []
++
++
++def test_console_progress_redirected_output():
++    output = io.StringIO()
++    ConsoleProgress(output)({"stage": "example", "completed": 3, "total": 3, "percent": 100})
++    assert "3/3 100.0%" in output.getvalue()
++
++
++def test_pipeline_to_validation_progress_and_reproducibility(tmp_path, monkeypatch):
++    for key, value in {
++        "ROOT_DIR": tmp_path,
++        "RAW_DATA_DIR": tmp_path / "raw",
++        "PROCESSED_DATA_DIR": tmp_path / "processed",
++        "RUNS_DIR": tmp_path / "runs",
++        "DATASET_CONFIGS_DIR": tmp_path / "configs",
++        "VALIDATION_RUNS_DIR": tmp_path / "validation",
++    }.items():
++        monkeypatch.setattr(paths, key, value)
++    monkeypatch.setattr(stamp, "LINEAGE_DIR", tmp_path / "lineage")
++    raw = paths.raw_dataset_root("tiny")
++    (raw / "images").mkdir(parents=True)
++    (raw / "labels").mkdir()
++    for i in range(12):
++        Image.new("RGB", (32, 32)).save(raw / "images" / f"{i}.jpg")
++        (raw / "labels" / f"{i}.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
++    events = []
++    first = DatasetPipeline("tiny", "yolo", classes=["item"], progress=events.append).run()
++    second = DatasetPipeline("tiny", "yolo", classes=["item"]).run()
++    assert sum(first["counts"].values()) == 12
++    assert first["contract_fingerprint"] == second["contract_fingerprint"]
++    assert any(e["stage"] == "convert:yolo" and e["completed"] == 12 for e in events)
++    assert any(e["stage"].startswith("materialize:") for e in events)
++    assert events[-1]["stage"] == "complete"
++    events.clear()
++    report = validate_dataset(first["yaml"], progress=events.append)
++    assert report.overall_severity in {"PASS", "INFO"}
++    assert any(e["stage"] == "manifest_lineage" and e["completed"] == 12 for e in events)
++    assert json.loads(
++        (paths.VALIDATION_RUNS_DIR / report.run_id / "report.json").read_text(encoding="utf-8")
++    )
+
+```
+
+## 【新增代码】scripts/check_data_engineering_ui.py
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/scripts/check_data_engineering_ui.py
++++ 新增版本/scripts/check_data_engineering_ui.py
+@@ -0,0 +1,143 @@
++"""新增：使用真实 Django API 的浏览器验收；仅在临时目录生成数据和数据库。
++
++可选依赖：pip install playwright；playwright install chromium。
++运行：python scripts/check_data_engineering_ui.py --screenshot <输出图片路径>
++"""
++
++from __future__ import annotations
++
++import argparse
++import sys
++import tempfile
++import threading
++from pathlib import Path
++from socketserver import ThreadingMixIn
++from unittest.mock import patch
++from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "apps" / "web-backend"))
++
++
++def main():
++    import os
++
++    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
++    import django
++    from django.conf import settings
++
++    django.setup()
++    from defect import data_understanding
++    from django.core.management import call_command
++    from django.core.wsgi import get_wsgi_application
++    from PIL import Image
++    from playwright.sync_api import expect, sync_playwright
++
++    from od_platform.common import paths, stamp
++    from od_platform.data_pipeline.orchestrator import DatasetPipeline
++
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--screenshot", type=Path)
++    parser.add_argument("--browser-channel", default=None, help="可使用已安装的 msedge 或 chrome")
++    args = parser.parse_args()
++
++    class QuietHandler(WSGIRequestHandler):
++        def log_message(self, format, *args):
++            pass
++
++    class ThreadedServer(ThreadingMixIn, WSGIServer):
++        daemon_threads = True
++
++    with (
++        tempfile.TemporaryDirectory(prefix="odp_ui_") as directory,
++        patch.multiple(
++            paths,
++            ROOT_DIR=Path(directory),
++            RAW_DATA_DIR=Path(directory) / "raw",
++            PROCESSED_DATA_DIR=Path(directory) / "processed",
++            RUNS_DIR=Path(directory) / "runs",
++            DATASET_CONFIGS_DIR=Path(directory) / "configs",
++            VALIDATION_RUNS_DIR=Path(directory) / "validation",
++        ),
++        patch.object(stamp, "LINEAGE_DIR", Path(directory) / "lineage"),
++    ):
++        temp_root = Path(directory)
++        settings.DATABASES["default"]["NAME"] = str(temp_root / "web.sqlite3")
++        settings.ALLOWED_HOSTS = [*settings.ALLOWED_HOSTS, "127.0.0.1"]
++        settings.MEDIA_ROOT = temp_root / "media"
++        call_command("migrate", interactive=False, verbosity=0)
++        raw = paths.raw_dataset_root("ui_demo")
++        (raw / "images").mkdir(parents=True)
++        (raw / "labels").mkdir()
++        for index in range(20):
++            Image.new("RGB", (64, 64), (40, 80, 120)).save(raw / "images" / f"{index}.jpg")
++            (raw / "labels" / f"{index}.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
++        DatasetPipeline("ui_demo", "yolo", classes=["item"]).run()
++        with (
++            patch.object(data_understanding, "DATASET_YAML", paths.dataset_yaml_path("ui_demo")),
++            patch.object(data_understanding, "DATASET_NAME", "ui_demo"),
++        ):
++            server = make_server(
++                "127.0.0.1", 0, get_wsgi_application(), ThreadedServer, QuietHandler
++            )
++            thread = threading.Thread(target=server.serve_forever, daemon=True)
++            thread.start()
++            try:
++                with sync_playwright() as playwright:
++                    browser = playwright.chromium.launch(channel=args.browser_channel)
++                    page = browser.new_page(viewport={"width": 1440, "height": 1000})
++                    errors = []
++                    page.on("pageerror", lambda error: errors.append(str(error)))
++                    page.goto(f"http://127.0.0.1:{server.server_port}/?module=understanding")
++                    card = page.locator(".pipeline-card")
++                    expect(card.get_by_role("button", name="运行 D4 质量检查")).to_be_enabled()
++
++                    def validate():
++                        card.get_by_role("button", name="运行 D4 质量检查").click()
++                        expect(card.get_by_role("button", name="运行 D4 质量检查")).to_be_enabled(
++                            timeout=15000
++                        )
++                        expect(card.locator(".data-report")).to_be_visible()
++
++                    validate()
++                    expect(card.locator(".data-table")).to_contain_text("image_integrity")
++                    expect(card.locator(".data-report")).to_contain_text("首次质检")
++                    image = next(
++                        (paths.dataset_processed_dir("ui_demo") / "images" / "train").glob("*.jpg")
++                    )
++                    original = image.read_bytes()
++                    image.write_bytes(b"corrupt")
++                    validate()
++                    expect(card.locator(".data-report")).to_contain_text("新增 1")
++                    image.write_bytes(original)
++                    validate()
++                    expect(card.locator(".data-report")).to_contain_text("已修复 1")
++                    card.get_by_role("button", name="运行 D3 转换与划分").click()
++                    expect(card.get_by_role("button", name="运行 D3 转换与划分")).to_be_enabled(
++                        timeout=15000
++                    )
++                    expect(card.locator(".data-progress")).to_contain_text("产出：")
++                    card.scroll_into_view_if_needed()
++                    if args.screenshot:
++                        args.screenshot.parent.mkdir(parents=True, exist_ok=True)
++                        card.screenshot(path=str(args.screenshot))
++                    page.set_viewport_size({"width": 390, "height": 844})
++                    assert page.evaluate(
++                        "document.documentElement.scrollWidth <= window.innerWidth"
++                    )
++                    assert not errors, errors
++                    browser.close()
++                    print(
++                        "Browser checks passed: D3, D4, progress, new/fixed issues, mobile layout."
++                    )
++            finally:
++                server.shutdown()
++                server.server_close()
++                thread.join(timeout=5)
++                from django.db import connections
++
++                connections.close_all()
++
++
++if __name__ == "__main__":
++    main()
+
+```
+
+## 【新增代码】docs/data_engineering.md
+
+注释：新增文件：完整新增代码。该文件为 D3/D4 共用进度、Web 展示、协作配置或验证代码。
+
+```diff
+--- 原版本/docs/data_engineering.md
++++ 新增版本/docs/data_engineering.md
+@@ -0,0 +1,62 @@
++# D3 / D4 数据工程新增功能
++
++本次在原目录和接口基础上扩展，不移动源文件。原分支已经具备 pytest 配置和 15 项质检，因此复用原检查并加强边界情况，新增 `image_integrity` 后共 16 项检查。
++
++## 使用
++
++在仓库根目录安装轻量开发依赖并启用提交前检查：
++
++```powershell
++python -m pip install -r requirements-dev.txt
++python -m pre_commit install
++powershell -ExecutionPolicy Bypass -File scripts/run_web.ps1
++```
++
++打开 `http://127.0.0.1:8000/?module=understanding`，在“数据工程 · D3 / D4”中选择数据集。将原始数据放在项目已有的 `data/raw/<dataset>/images` 和 `labels`（YOLO）或 `annotations`（VOC/COCO）目录；YOLO 必须填写与原标签一致的类别顺序。点击“运行 D3 转换与划分”生成成品，再点击“运行 D4 质量检查”。训练期间页面及 API 拒绝重新转换数据。
++
++进度条显示当前阶段的实际完成数和总数；阶段切换时计数重新开始。无法预先计数的准备、划分和报告阶段显示处理中。刷新页面后会重新连接当前后台任务。质检发现 ERROR/WARNING 会完成并展示问题报告；运行异常才显示执行失败。
++
++命令行也默认显示进度条，自动化调用可用 `--no-progress` 关闭：
++
++```powershell
++$env:PYTHONPATH = 'apps/platform/src'
++python -m od_platform.cli.transform_data --dataset demoyolo --format yolo --classes head 反光衣
++python -m od_platform.cli.validate_data apps/platform/configs/datasets/demoyolo.yaml
++```
++
++## 质检与历史
++
++- 图片：先校验文件容器，再实际解码像素，空图、损坏图及截断图片均报 ERROR。
++- 标签：复用原有结构、`0 <= class_id < nc`、坐标归一化与边界检查；新增 NaN/Infinity、非正框尺寸、编码/读取错误处理。bbox 边界仍按原有容差及比例分级。
++- 契约：逐样本 SHA256 独立重算的语义保持一致，加入进度反馈。
++- 报告：保存到 `runs/data_validation/<run_id>/report.json`、`results.csv`，JSON 采用原子替换；运行 ID 包含微秒和随机后缀，显式重复 ID 会被拒绝。
++- 历史：只比较同一 YAML 路径、同一任务的上一次报告。首次运行建立基线。图片、标签格式、框越界、契约按文件/行/问题类型精确比较，其他原有检查按检查项跟踪。完整问题保存在 JSON，页面每类预览最多 100 条、历史记录最多 50 次，总数不受预览限制。跳过、崩溃和无法读取的文件不冒充已修复；旧报告粒度不同时重新建立该检查的基线。
++
++新增 API：`GET /api/data/engineering/` 查看可用数据集及检查，`GET/POST /api/data/jobs/` 查询或启动任务，`GET /api/data/history/?dataset=<name>` 查询历史。原 `/api/data/validate/` 现为后台接口，POST 返回 HTTP 202，GET 查询状态；调用者需轮询任务状态，报告严重度位于 `result.overall_severity`。
++
++Web 任务管理沿用项目现有训练管理器的单进程方式，适配 `scripts/run_web.ps1`；服务重启会中断内存中的任务，磁盘质检历史保留。多 worker 部署时需先迁移到共享任务队列。
++
++## 验证与协作
++
++```powershell
++python -m pytest --ignore=apps/platform/tests/test_inference_config.py
++python apps/web-backend/manage.py test defect --noinput
++node --check apps/web-backend/frontend/static/frontend/app.js
++```
++
++数据工程测试生成真实可解码图片、临时源数据、成品和流转章，无需提前运行 checkpoint 或下载训练模型。轻量环境没有安装 torch/ultralytics，所以上述命令仅排除依赖该推理运行时的原有 `test_inference_config.py`；安装完整 platform 依赖后可运行不带排除参数的全量 pytest。
++
++`.pre-commit-config.yaml` 对本次提交的 Python 文件执行 Ruff lint 和格式检查。为避免本次功能扩大为全仓格式重写，GitHub Actions 同样只检查变更文件；测试覆盖轻量环境中的核心套件和全部 Django 测试。每位协作者克隆后需自行执行 `python -m pre_commit install`。
++
++可选浏览器验收（本机 Edge 可直接使用，无需下载 Chromium）：
++
++```powershell
++python -m pip install playwright
++python scripts/check_data_engineering_ui.py --browser-channel msedge --screenshot tmp/data-engineering.png
++```
++
++该脚本启动临时数据库和真实 Django API，验证 D3、D4、进度、损坏/修复对比与移动端布局，退出后清理临时数据。使用默认 Chromium 时需先运行 `python -m playwright install chromium`。
++
++## 原讲义副本
++
++`D3_new_function.txt`、`D4_new_function.txt` 的前半部分逐字节复制自用户提供的 D3/D4 原讲义，后半部分为新增功能说明和代码补丁。附录使用 `+` 标明新增行、`-` 标明替换的旧行，并对每个文件说明用途。原讲义中的旧检查数量、空图片演示及测试指令保留原样，当前实现以附录和本指南为准。
+
+```

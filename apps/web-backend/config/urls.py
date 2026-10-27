@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-from django.conf import settings
-from django.conf.urls.static import static
-from django.contrib import admin
-from django.urls import include, path
-from django.views.static import serve
-from rest_framework.routers import DefaultRouter
-
-from config.views import frontend_index
 from defect.api_views import (
     DefectRecordViewSet,
     DefectTypeViewSet,
     dashboard_overview,
     dashboard_stats,
+    data_engineering,
+    data_job_control,
+    data_validation_history,
     dataset_overview,
     dataset_sample,
-    model_overview,
     model_evaluation,
     model_evaluation_artifact,
+    model_overview,
     recognition_record_detail,
     recognition_records,
     training_cancel,
@@ -27,6 +22,14 @@ from defect.api_views import (
     video_recognition_detail,
     video_recognition_records,
 )
+from django.conf import settings
+from django.conf.urls.static import static
+from django.contrib import admin
+from django.urls import include, path
+from django.views.static import serve
+from rest_framework.routers import DefaultRouter
+
+from config.views import frontend_index
 
 router = DefaultRouter()
 router.register("defect-type", DefectTypeViewSet, basename="defect-type")
@@ -39,6 +42,9 @@ urlpatterns = [
     path("api/dashboard/", dashboard_overview, name="dashboard-overview"),
     path("api/data/", dataset_overview, name="dataset-overview"),
     path("api/data/validate/", validate_dataset, name="dataset-validate"),
+    path("api/data/jobs/", data_job_control, name="data-jobs"),
+    path("api/data/engineering/", data_engineering, name="data-engineering"),
+    path("api/data/history/", data_validation_history, name="data-history"),
     path(
         "api/data/sample/<str:split>/<str:filename>",
         dataset_sample,

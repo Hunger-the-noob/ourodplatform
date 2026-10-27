@@ -314,3 +314,21 @@ noscript { display:block; padding:40px; text-align:center; }
     .table-tools input { width:100%; }
     .toast { right:12px; bottom:12px; left:12px; }
 }
+/* 新增：D3/D4 数据工程控制区、阶段进度与可横向滚动的质检表格。 */
+.data-form { border:0; padding:0; margin:20px 0; display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:16px; }
+.data-form select { width:100%; min-height:40px; border:1px solid #d8e0eb; border-radius:8px; padding:8px; background:white; color:#23344d; }
+.data-actions { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin:16px 0; }
+.data-actions span,.data-progress small,.data-report small { color:#68788e; }
+.data-progress { background:#f0f5fc; padding:18px; border-radius:12px; margin:18px 0; }
+.data-progress progress { width:100%; height:18px; accent-color:#3874e7; }
+.data-report { margin:24px 0; }
+.data-table-wrap { max-width:100%; overflow-x:auto; margin:16px 0; }
+.data-table { width:100%; border-collapse:collapse; font-size:13px; text-align:left; }
+.data-table td,.data-table th { padding:10px 12px; border-bottom:1px solid #e2e8f0; vertical-align:top; }
+.data-report details { margin:14px 0; overflow-wrap:anywhere; }
+.data-report summary { cursor:pointer; font-weight:600; }
+.data-report li { margin:7px 0; }
+.severity-error { color:#bf233c; }
+.severity-warning { color:#9b6200; }
+.severity-info { color:#2862b0; }
+.severity-pass { color:#157648; }

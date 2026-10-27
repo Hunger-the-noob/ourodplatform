@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import subprocess
-import sys
 from collections import Counter
 from pathlib import Path
 from uuid import uuid4
 
 from django.core.files.base import ContentFile
-from django.db.models import Count, Q
+from django.db.models import Count
 from django.http import FileResponse
 from django.utils import timezone
 from rest_framework import filters, permissions, viewsets
@@ -15,19 +13,20 @@ from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
+from .data_jobs import data_jobs, dataset_history, engineering_catalog
 from .data_understanding import (
     DATASET_YAML,
     dataset_sample_path,
     get_dataset_understanding,
 )
 from .evaluation import evaluation_artifact, latest_evaluation, run_test_evaluation
+from .model_info import get_model_overview, latest_training_curve
 from .models import (
     DefectRecord,
     DefectType,
     RecognitionRecord,
     VideoRecognitionRecord,
 )
-from .model_info import get_model_overview, latest_training_curve
 from .recognition import recognize_image_file
 from .serializers import (
     DefectRecordSerializer,
@@ -78,10 +77,7 @@ def _defect_stats_payload() -> dict:
         "high_confidence": records.filter(confidence__gte=0.8).count(),
         "total_types": DefectType.objects.count(),
         "average_confidence": round(
-            (
-                sum(records.values_list("confidence", flat=True))
-                / max(records.count(), 1)
-            ),
+            (sum(records.values_list("confidence", flat=True)) / max(records.count(), 1)),
             3,
         ),
         "type_counts": list(type_counts),
@@ -122,43 +118,78 @@ def dataset_sample(request, split: str, filename: str):
     return FileResponse(sample.open("rb"), content_type=content_type)
 
 
-@api_view(["POST"])
+@api_view(["GET", "POST"])
 def validate_dataset(request):
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "od_platform.cli.validate_data",
-            str(DATASET_YAML),
-        ],
-        cwd=str(DATASET_YAML.parents[4]),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=120,
-    )
-    details = get_dataset_understanding()
-    return Response(
-        {
-            "success": result.returncode == 0,
-            "exit_code": result.returncode,
-            "validation": details.get("validation", {}),
-            "summary": (
-                "数据验证通过"
-                if result.returncode == 0
-                else "数据验证未通过，请查看命令行日志"
+    """新增：立即返回任务状态，耗时质检在后台执行。"""
+    if request.method == "GET":
+        return Response(data_jobs.status())
+    try:
+        return Response(
+            data_jobs.start("validate", request.data.get("dataset", DATASET_YAML.stem)), status=202
+        )
+    except RuntimeError as exc:
+        return Response({"detail": str(exc)}, status=409)
+    except (TypeError, ValueError) as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+
+@api_view(["GET", "POST"])
+def data_job_control(request):
+    if request.method == "GET":
+        return Response(data_jobs.status())
+    try:
+        if (
+            request.data.get("operation", "transform") == "transform"
+            and training_jobs.status().get("status") == "running"
+        ):
+            return Response({"detail": "训练正在使用当前数据，请等待训练完成后再转换"}, status=409)
+        options = {
+            key: request.data[key]
+            for key in (
+                "format",
+                "task",
+                "classes",
+                "train_rate",
+                "val_rate",
+                "seed",
+                "split_strategy",
+            )
+            if key in request.data
+        }
+        return Response(
+            data_jobs.start(
+                request.data.get("operation", "transform"),
+                request.data.get("dataset", DATASET_YAML.stem),
+                **options,
             ),
-            "output_tail": "\n".join(result.stdout.splitlines()[-20:]),
-        },
-        status=200 if result.returncode == 0 else 422,
-    )
+            status=202,
+        )
+    except RuntimeError as exc:
+        return Response({"detail": str(exc)}, status=409)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+
+@api_view(["GET"])
+def data_engineering(request):
+    return Response(engineering_catalog())
+
+
+@api_view(["GET"])
+def data_validation_history(request):
+    try:
+        return Response(dataset_history(request.query_params.get("dataset", DATASET_YAML.stem)))
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
 
 
 @api_view(["GET", "POST"])
 def training_control(request):
     if request.method == "GET":
         return Response(training_jobs.status())
+    data_state = data_jobs.status()
+    if data_state.get("status") == "running" and data_state.get("operation") == "transform":
+        return Response({"detail": "数据转换尚未完成，请等待后再训练"}, status=409)
     current = training_jobs.status()
     if current.get("status") == "running":
         return Response({"detail": "已有训练任务正在运行。"}, status=409)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from PIL import Image
@@ -30,6 +33,13 @@ def make_test_image() -> SimpleUploadedFile:
 
 class DefectApiTests(TestCase):
     def setUp(self):
+        # 新增：Web 回归测试的图片和模型占位文件全部留在临时目录。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.temp_root = Path(temporary.name)
+        media_settings = self.settings(MEDIA_ROOT=self.temp_root / "media")
+        media_settings.enable()
+        self.addCleanup(media_settings.disable)
         self.client = APIClient()
         self.defect_type, _ = DefectType.objects.get_or_create(
             type_name="测试划痕",
@@ -151,7 +161,18 @@ class DefectApiTests(TestCase):
         self.assertIn("detail", response.data)
 
     def test_dataset_and_dashboard_endpoints(self):
-        dataset = self.client.get("/api/data/")
+        images = self.temp_root / "images" / "train"
+        images.mkdir(parents=True)
+        Image.new("RGB", (32, 32)).save(images / "sample.jpg")
+        config = self.temp_root / "dataset.yaml"
+        config.write_text(
+            yaml.safe_dump(
+                {"path": str(self.temp_root), "nc": 10, "names": [f"class_{i}" for i in range(10)]}
+            ),
+            encoding="utf-8",
+        )
+        with patch("defect.data_understanding.DATASET_YAML", config):
+            dataset = self.client.get("/api/data/")
         self.assertEqual(dataset.status_code, 200)
         self.assertEqual(dataset.data["class_count"], 10)
         self.assertGreater(dataset.data["total_images"], 0)
@@ -214,13 +235,19 @@ class DefectApiTests(TestCase):
         process.poll.return_value = None
         popen_mock.return_value = process
         manager = TrainingJobManager()
-
-        snapshot = manager.start(
-            epochs=1,
-            imgsz=416,
-            batch="16",
-            device="cpu",
-        )
+        model = self.temp_root / "models" / "pretrained" / "yolov8n.pt"
+        model.parent.mkdir(parents=True)
+        model.touch()  # Popen 已 mock，测试只需存在性，不下载模型。
+        with (
+            patch("defect.training_jobs.PROJECT_ROOT", self.temp_root),
+            patch("defect.training_jobs.WEB_TRAINING_RUNS", self.temp_root / "runs"),
+        ):
+            snapshot = manager.start(
+                epochs=1,
+                imgsz=416,
+                batch="16",
+                device="cpu",
+            )
         self.assertEqual(snapshot["status"], "running")
         self.assertEqual(snapshot["total_epochs"], 1)
 

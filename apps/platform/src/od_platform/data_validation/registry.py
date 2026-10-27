@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding:utf-8 -*-
 # @FileName  : registry.py
 # @Author    : ODPlatform Team
 # @Project   : ODPlatform
@@ -9,11 +8,13 @@
 严重度四级:ERROR(必须修)> WARNING(可训但建议修)> INFO(提示)> PASS(通过);
 rank() 供聚合取"全场最严"。重复注册直接 ValueError —— 静默覆盖等于埋雷。
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any
 
 from od_platform.data_validation.snapshot import DatasetSnapshot
 
@@ -35,8 +36,10 @@ class CheckSeverity:
 class CheckResult:
     name: str
     severity: str
-    summary: str                                     # 一句话结论(给人看)
-    details: Dict[str, Any] = field(default_factory=dict)  # 结构化证据(给程序看)
+    summary: str  # 一句话结论(给人看)
+    details: dict[str, Any] = field(default_factory=dict)  # 结构化证据(给程序看)
+    # 新增：完整问题身份表，供历史对比使用；None 表示旧检查仅按检查项对比。
+    issues: list[dict[str, Any]] | None = None
 
     @property
     def passed(self) -> bool:
@@ -46,6 +49,7 @@ class CheckResult:
 @dataclass
 class CheckContext:
     """一次质检运行共享的上下文。"""
+
     yaml_path: Path
     snapshot: DatasetSnapshot
 
@@ -59,17 +63,19 @@ class CheckEntry:
     func: CheckFunc
 
 
-_REGISTRY: Dict[str, CheckEntry] = {}
+_REGISTRY: dict[str, CheckEntry] = {}
 _LAZY_INITIALIZED = False
 
 
 def check(name: str):
     """装饰器:把函数注册为质检项。"""
+
     def deco(func: CheckFunc) -> CheckFunc:
         if name in _REGISTRY:
             raise ValueError(f"质检项重复注册: {name!r}")
         _REGISTRY[name] = CheckEntry(name=name, func=func)
         return func
+
     return deco
 
 
@@ -79,20 +85,21 @@ def _lazy_init() -> None:
         return
     from od_platform.common.registry_utils import import_submodules
     from od_platform.data_validation import checks
+
     import_submodules(checks)
     _LAZY_INITIALIZED = True
 
 
-def get_all_checks() -> List[CheckEntry]:
+def get_all_checks() -> list[CheckEntry]:
     _lazy_init()
     return [_REGISTRY[k] for k in sorted(_REGISTRY)]
 
 
 def get_check(name: str) -> CheckEntry:
     _lazy_init()
-    return _REGISTRY[name]          # 名字写错就该炸(KeyError)
+    return _REGISTRY[name]  # 名字写错就该炸(KeyError)
 
 
-def list_check_names() -> List[str]:
+def list_check_names() -> list[str]:
     _lazy_init()
     return sorted(_REGISTRY)
